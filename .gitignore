@@ -1,0 +1,63 @@
+# Per-library state, credentials, logs, and markers
+.media-manager/
+.media-manager.json
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Local credentials and environment overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Media, subtitle, and model artifacts
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.m4v
+*.ts
+*.webm
+*.srt
+*.ass
+*.ssa
+*.vtt
+*.pth
+*.pt
+*.model
+*.onnx
+
+# Python and test output
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+wheelhouse/
+.venv/
+venv/
+
+# Local reports, scratch data, and archives
+artifacts/
+test-artifacts/
+logs/
+*.log
+*.zip
+*.tar
+*.tar.gz
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db

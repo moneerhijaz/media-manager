@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stateful-media-manager"
+version = "0.5.3"
+description = "Stateful Plex-style media QA and repair manager"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = ["ffsubsync>=0.5.1", "numpy>=1.26"]
+
+[project.optional-dependencies]
+avsync = [
+  "numpy>=1.26",
+  "opencv-python-headless>=4.8",
+  "silero-vad>=6.0",
+  "scenedetect[opencv]>=0.6,<0.7",
+  "syncnet-python",
+]
+dev = ["pytest>=8"]
+
+[project.scripts]
+media-manager = "media_manager.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["media_manager*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
