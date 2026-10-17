@@ -212,10 +212,67 @@ def cmd_plan(args) -> int:
     return 0
 
 
+def _reviewed_selection(
+    db: Database,
+    *,
+    stage: str | None = None,
+    limit: int | None = None,
+    media_id: int | None = None,
+) -> dict[int, list[str]]:
+    params: list[object] = []
+    stage_clause = ""
+    if stage:
+        stage_clause = " AND s.stage=?"
+        params.append(stage)
+    if media_id is not None:
+        stage_clause += " AND m.id=?"
+        params.append(int(media_id))
+    rows = db.conn.execute(
+        """SELECT m.id,m.rel_path,s.stage FROM stages s
+           JOIN media m ON m.id=s.media_id
+           WHERE m.present=1 AND s.status IN ('needs_review','insufficient_evidence','failed')"""
+        + stage_clause + " ORDER BY m.rel_path,s.stage",
+        params,
+    ).fetchall()
+    selected: dict[int, list[str]] = {}
+    for row in rows:
+        media_id = int(row["id"])
+        if limit is not None and media_id not in selected and len(selected) >= limit:
+            continue
+        selected.setdefault(media_id, []).append(str(row["stage"]))
+    return selected
+
+
+def _print_reviewed_plan(cfg: LibraryConfig, args) -> int:
+    with _db(cfg) as db:
+        selected = _reviewed_selection(
+            db,
+            stage=getattr(args, "review_stage", None),
+            limit=getattr(args, "limit", None),
+            media_id=getattr(args, "media_id", None),
+        )
+        print(f"Library: {cfg.root}")
+        print("Mode: reviewed-only (no filesystem/library scan)")
+        if not selected:
+            print("No matching review stages.")
+            return 0
+        for index, (media_id, stages) in enumerate(selected.items(), 1):
+            row = db.get_media(media_id)
+            print(f"{index:4d}. {row['rel_path']}")
+            print("      " + " -> ".join(stages))
+        print(f"Would retry {sum(len(value) for value in selected.values())} stage(s) on {len(selected)} media item(s).")
+    return 0
+
+
 def cmd_run(args) -> int:
+    cfg = _ensure_config(
+        args,
+        auto_init=True,
+        prompt_opensubtitles=not bool(getattr(args, "dry_run", False)),
+    )
+    reviewed_only = bool(getattr(args, "reviewed_only", False))
     if getattr(args, "dry_run", False):
-        return cmd_plan(args)
-    cfg = _ensure_config(args, auto_init=True, prompt_opensubtitles=True)
+        return _print_reviewed_plan(cfg, args) if reviewed_only else cmd_plan(args)
     cfg.data.setdefault("_runtime", {})
     cfg.data["_runtime"]["skip_av_sync"] = bool(args.no_av_sync)
     cfg.data["_runtime"]["skip_crop"] = bool(args.no_crop)
@@ -237,13 +294,46 @@ def cmd_run(args) -> int:
                     "Recovered prior state: "
                     + ", ".join(f"{k}={v}" for k, v in recovered.items() if v)
                 )
+            selected_ids: list[int] | None = None
+            if reviewed_only:
+                selection = _reviewed_selection(
+                    db,
+                    stage=getattr(args, "review_stage", None),
+                    limit=args.limit,
+                    media_id=getattr(args, "media_id", None),
+                )
+                prepared, stage_count = db.prepare_reviewed_retry(
+                    media_ids=selection.keys(), stage=getattr(args, "review_stage", None)
+                )
+                # Keep the original snapshot authoritative: no new review that
+                # appears during this run is silently pulled into the batch.
+                prepared = {
+                    media_id: [stage for stage in stages if stage in selection.get(media_id, [])]
+                    for media_id, stages in prepared.items()
+                    if media_id in selection
+                }
+                cfg.data["_runtime"]["selected_stages"] = {
+                    str(media_id): stages for media_id, stages in prepared.items()
+                }
+                selected_ids = list(prepared)
+                if args.verbose:
+                    print(f"Prepared {stage_count} reviewed stage(s); full library scan disabled.")
             run_id = db.start_run(
                 pid=os.getpid(),
                 hostname=socket.gethostname(),
                 command=_redacted_command(sys.argv),
             )
             try:
-                counts = scan_and_run(cfg, db, limit=args.limit, verbose=args.verbose, client=client, progress_enabled=not args.no_progress)
+                counts = scan_and_run(
+                    cfg,
+                    db,
+                    limit=None if reviewed_only else args.limit,
+                    verbose=args.verbose,
+                    client=client,
+                    progress_enabled=not args.no_progress,
+                    scan=not reviewed_only,
+                    media_ids=selected_ids,
+                )
                 remaining = client.remaining_downloads if client else None
             except KeyboardInterrupt:
                 db.finish_run(run_id, "paused", "Interrupted by SIGINT/Ctrl+C; resumable checkpoints preserved")
@@ -302,7 +392,7 @@ def _pid_matches_library(pid: int, cfg: LibraryConfig) -> bool:
         cwd = Path(f"/proc/{int(pid)}/cwd").resolve()
     except (FileNotFoundError, ProcessLookupError, PermissionError, OSError):
         return False
-    return b"media-manager" in cmdline and cwd == cfg.root
+    return (b"media-manager" in cmdline or b"media_manager" in cmdline) and cwd == cfg.root
 
 
 def _descendant_pids(root_pid: int) -> list[int]:
@@ -530,19 +620,84 @@ def cmd_progress(args) -> int:
 def cmd_review(args) -> int:
     cfg = _ensure_config(args, auto_init=False)
     with _db(cfg) as db:
-        rows = db.rows("present=1 AND overall_status IN ('needs_review','failed')")
-        if not rows:
+        params: list[object] = []
+        stage_filter = ""
+        if getattr(args, "stage", None):
+            stage_filter = " AND s.stage=?"
+            params.append(args.stage)
+        problem_rows = db.conn.execute(
+            """SELECT m.id,m.rel_path,m.overall_status,m.last_error,s.stage,s.status,s.details_json
+               FROM media m JOIN stages s ON s.media_id=m.id
+               WHERE m.present=1 AND s.status IN ('needs_review','insufficient_evidence','failed')"""
+            + stage_filter + " ORDER BY m.rel_path,s.stage",
+            params,
+        ).fetchall()
+        if not problem_rows:
             print("Review queue is empty.")
             return 0
-        for row in rows:
-            print(f"\n{row['rel_path']}  [{row['overall_status']}]")
-            if row["last_error"]:
-                print(f"  {row['last_error']}")
-            for name, stage in db.stages(int(row["id"])).items():
-                if stage["status"] in {"needs_review", "failed", "insufficient_evidence"}:
-                    d = json.loads(stage["details_json"] or "{}")
-                    reason = d.get("reason") or d.get("error") or d.get("correction_error") or ""
-                    print(f"  {name}: {stage['status']} {reason}")
+        items = []
+        for row in problem_rows:
+            details = json.loads(row["details_json"] or "{}")
+            items.append({
+                "media_id": int(row["id"]), "path": row["rel_path"],
+                "overall_status": row["overall_status"], "stage": row["stage"],
+                "status": row["status"],
+                "reason": details.get("reason") or details.get("error") or details.get("correction_error") or row["last_error"] or "",
+            })
+        if getattr(args, "json", False):
+            print(json.dumps(items, indent=2, ensure_ascii=False)); return 0
+        if getattr(args, "summary", False):
+            counts: dict[tuple[str, str], int] = {}
+            for item in items:
+                key = (str(item["stage"]), str(item["status"]))
+                counts[key] = counts.get(key, 0) + 1
+            print(f"Review stages: {len(items)} across {len({item['media_id'] for item in items})} media item(s)")
+            for (stage, status), count in sorted(counts.items()):
+                print(f"  {stage:20s} {status:24s} {count}")
+            return 0
+        current_id = None
+        for item in items:
+            if item["media_id"] != current_id:
+                current_id = item["media_id"]
+                print(f"\n{item['path']}  [{item['overall_status']}]")
+            print(f"  {item['stage']}: {item['status']} {item['reason']}")
+    return 0
+
+
+def cmd_history(args) -> int:
+    cfg = _ensure_config(args, auto_init=False)
+    with _db(cfg) as db:
+        if args.path:
+            row = db.find_media_by_path(args.path, cfg.root)
+            if row is None:
+                raise MediaManagerError(f"Not found in database: {args.path}")
+            events = db.conn.execute(
+                "SELECT created_at,kind,message,details_json FROM events WHERE media_id=? ORDER BY id DESC LIMIT ?",
+                (int(row["id"]), int(args.limit)),
+            ).fetchall()
+            print(f"History: {row['rel_path']}")
+            for event in events:
+                print(f"{event['created_at']}  {event['kind']}: {event['message']}")
+        else:
+            runs = db.conn.execute(
+                "SELECT id,started_at,ended_at,status,pid,reason FROM runs ORDER BY id DESC LIMIT ?",
+                (int(args.limit),),
+            ).fetchall()
+            for run in runs:
+                suffix = f" — {run['reason']}" if run["reason"] else ""
+                print(f"#{run['id']} {run['started_at']}  {run['status']}  ended={run['ended_at'] or '-'}{suffix}")
+    return 0
+
+
+def cmd_help(args) -> int:
+    parser = args.root_parser
+    if not args.topic:
+        parser.print_help(); return 0
+    subparsers = next(action for action in parser._actions if isinstance(action, argparse._SubParsersAction))
+    command = subparsers.choices.get(args.topic)
+    if command is None:
+        raise MediaManagerError(f"Unknown command: {args.topic}")
+    command.print_help()
     return 0
 
 
@@ -813,6 +968,22 @@ def cmd_set_visual_type(args) -> int:
     return 0
 
 
+def cmd_web(args) -> int:
+    library_root = Path(args.library_root).expanduser().resolve()
+    if not library_root.is_dir():
+        raise MediaManagerError(f"Library root is not a directory: {library_root}")
+    os.chdir(library_root)
+    cfg = _ensure_config(args, auto_init=True)
+    from .web import serve
+    serve(
+        cfg,
+        host=str(args.host),
+        port=int(args.port),
+        token_file=Path(args.token_file).expanduser().resolve() if args.token_file else None,
+    )
+    return 0
+
+
 def add_os_flags(p):
     p.add_argument("--opensubtitles-username", "--os-user", dest="os_user")
     p.add_argument("--opensubtitles-api-key", "--os-api-key", dest="os_api_key")
@@ -828,6 +999,13 @@ def _add_run_flags(q) -> None:
     q.add_argument("--subtitle-language", help="Comma-separated languages, e.g. en,ar")
     q.add_argument("-v", "--verbose", action="store_true")
     q.add_argument("--no-progress", action="store_true", help="Disable the live single-line progress display")
+    q.add_argument(
+        "--reviewed-only",
+        action="store_true",
+        help="Retry only the current review queue without rescanning the library",
+    )
+    q.add_argument("--review-stage", help="With --reviewed-only, retry only this stage (for example av_sync)")
+    q.add_argument("--media-id", type=int, help="With --reviewed-only, retry only this database media ID")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -850,6 +1028,9 @@ def build_parser() -> argparse.ArgumentParser:
     q = sub.add_parser("resume", help="Resume the same checkpointed pipeline as 'run'")
     _add_run_flags(q); q.set_defaults(func=cmd_run)
 
+    q = sub.add_parser("rerun-reviewed", help="Retry only reviewed stages; do not rescan the whole library")
+    _add_run_flags(q); q.set_defaults(func=cmd_run, reviewed_only=True)
+
     q = sub.add_parser("pause", help="Gracefully pause the active run for this library")
     q.add_argument("--timeout", type=float, default=30.0, help="Seconds to wait for a clean stop (default: 30)")
     q.add_argument("--force", action="store_true", help="Terminate a run that ignores the clean pause request")
@@ -860,6 +1041,9 @@ def build_parser() -> argparse.ArgumentParser:
     q = sub.add_parser("progress", help="Show the currently active file/stage and checkpoint progress")
     q.add_argument("--watch", action="store_true"); q.add_argument("--interval", type=float, default=2.0); q.set_defaults(func=cmd_progress)
     q = sub.add_parser("review", help="Show files requiring review")
+    q.add_argument("--summary", action="store_true", help="Group review counts by stage/status")
+    q.add_argument("--stage", help="Show only one stage")
+    q.add_argument("--json", action="store_true", help="Emit machine-readable review records")
     q.set_defaults(func=cmd_review)
     q = sub.add_parser("explain", help="Explain all recorded decisions for one media file")
     q.add_argument("path"); q.set_defaults(func=cmd_explain)
@@ -873,6 +1057,16 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--force", action="store_true"); q.set_defaults(func=cmd_setup_syncnet)
     q = sub.add_parser("set-visual-type", help="Override live_action/animation/mixed/unknown for one media item")
     q.add_argument("path"); q.add_argument("type", choices=[x.value for x in VisualType]); q.set_defaults(func=cmd_set_visual_type)
+    q = sub.add_parser("web", help="Run the authenticated local web dashboard")
+    q.add_argument("--library-root", default=".", help="Initialized media library (default: current directory)")
+    q.add_argument("--host", default="0.0.0.0", help="Listen on every network interface (default: 0.0.0.0)")
+    q.add_argument("--port", type=int, default=8787, help="Listen port (default: 8787)")
+    q.add_argument("--token-file", help="Dashboard token file (default: .media-manager/web-token)")
+    q.set_defaults(func=cmd_web)
+    q = sub.add_parser("history", help="Show recent runs or events for one media file")
+    q.add_argument("path", nargs="?"); q.add_argument("--limit", type=int, default=25); q.set_defaults(func=cmd_history)
+    q = sub.add_parser("help", help="Show general help or help for one command")
+    q.add_argument("topic", nargs="?"); q.set_defaults(func=cmd_help, root_parser=p)
     return p
 
 

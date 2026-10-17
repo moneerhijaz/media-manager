@@ -45,6 +45,53 @@ def test_speech_candidate_pool_is_larger_than_syncnet_target():
     assert len(candidates) <= 36
 
 
+def test_candidate_pool_can_reach_configured_adaptive_limit():
+    from media_manager.config import DEFAULT_CONFIG
+
+    candidates = engine._speech_candidates([(0.0, 7200.0)], 7200.0, DEFAULT_CONFIG["av_sync"])
+    assert len(candidates) == 64
+
+
+def test_saved_observations_reject_low_confidence_and_nonfinite_evidence():
+    from media_manager.config import DEFAULT_CONFIG
+
+    data = {"observations": [
+        {"time": 100.0, "offset_frames": 2.0, "confidence": confidence}
+        for confidence in (8.0, 1.0, float("nan"), float("inf"))
+    ]}
+    assert engine.evaluate_saved_observations(
+        data, DEFAULT_CONFIG["av_sync"], duration=3600, visual_type=VisualType.UNKNOWN
+    ) is None
+
+
+def test_inconclusive_av_is_a_gap_and_preserves_evidence(tmp_path, monkeypatch):
+    import json
+    from media_manager import executor
+    from media_manager.config import LibraryConfig
+    from media_manager.database import Database
+    from media_manager.models import AVAnalysis
+
+    cfg = LibraryConfig.init(tmp_path)
+    source = tmp_path / "movie.mp4"
+    source.write_bytes(b"test")
+    monkeypatch.setattr(executor, "probe_media", lambda path: object())
+    monkeypatch.setattr(executor, "analyze_av_sync", lambda *a, **kw: AVAnalysis(
+        StageStatus.INSUFFICIENT_EVIDENCE, reason="No sustained speech candidates"))
+    monkeypatch.setattr(executor, "apply_verified_av_correction", lambda *a, **kw: pytest.fail("Must not correct uncertain media"))
+    with Database(cfg.state_dir / "media-manager.db") as db:
+        media_id = int(db.conn.execute(
+            "INSERT INTO media(rel_path,media_type,title,size,mtime_ns,fingerprint,duration,probe_json,last_seen) "
+            "VALUES('movie.mp4','movie','Movie',4,1,'fp',100,'{}','now')"
+        ).lastrowid)
+        for stage in ("identity", "integrity", "visual_type", "crop", "subtitle:en", "final_verify"):
+            db.set_stage(media_id, stage, StageStatus.COMPLETE)
+        executor._av_stage(source, db.get_media(media_id), cfg, db, tmp_path, VisualType.UNKNOWN)
+        stage = db.get_stage(media_id, "av_sync")
+        assert stage["status"] == "unavailable"
+        assert json.loads(stage["details_json"])["analysis_status"] == "insufficient_evidence"
+        assert executor._overall(db, media_id, ["en"]) == "managed_with_gaps"
+
+
 def test_face_hint_uses_configurable_low_rate_sampling(monkeypatch, tmp_path):
     seen = {}
 
@@ -210,12 +257,46 @@ def test_silero_vad_streams_ffmpeg_pcm_without_torchaudio_file_io(monkeypatch, t
 
 def test_avsync_algorithm_version_invalidates_old_torchcodec_failure():
     from media_manager.executor import AVSYNC_ALGORITHM_VERSION, _stage_needs_work
-    assert AVSYNC_ALGORITHM_VERSION == "avsync-v8-syncnet-adapter-fix"
+    assert AVSYNC_ALGORITHM_VERSION == "avsync-v9-robust-policy"
     old = {
         "status": "needs_review",
         "details_json": '{"algorithm_version":"avsync-v4-speech-syncnet-evidence","error":"torchaudio requires torchcodec"}',
     }
     assert _stage_needs_work("av_sync", old)
+
+
+def test_robust_drift_ignores_one_outlier_and_requires_runtime_coverage():
+    from media_manager.models import AVObservation
+
+    observations = [
+        AVObservation(time, frames, 8.0)
+        for time, frames in [(0, 2), (900, 2), (1800, 20), (2700, 2), (3600, 2)]
+    ]
+    drift, evidence = engine._robust_drift(observations, 3600.0)
+    assert abs(drift) < 1.0
+    assert evidence["actionable"] is True
+
+    short_span = [AVObservation(float(i * 10), float(i), 8.0) for i in range(5)]
+    drift, evidence = engine._robust_drift(short_span, 3600.0)
+    assert drift > 80.0
+    assert evidence["actionable"] is False
+
+
+def test_saved_observations_use_current_policy_without_visual_hard_gate():
+    from media_manager.config import DEFAULT_CONFIG
+
+    data = {
+        "reference_audio_index": 0,
+        "observations": [
+            {"time": time, "offset_frames": 3.0, "confidence": 8.0}
+            for time in (100.0, 1800.0, 3400.0)
+        ],
+    }
+    result = engine.evaluate_saved_observations(
+        data, DEFAULT_CONFIG["av_sync"], duration=3600.0, visual_type=VisualType.ANIMATION
+    )
+    assert result is not None
+    assert result.status == StageStatus.COMPLETE
 
 
 def test_long_speech_segment_generates_multiple_overlapping_windows():

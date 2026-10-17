@@ -342,6 +342,52 @@ class Database:
         self.conn.commit()
         return cur.rowcount
 
+    def prepare_reviewed_retry(
+        self, *, media_ids: Iterable[int] | None = None, stage: str | None = None
+    ) -> tuple[dict[int, list[str]], int]:
+        """Make only review outcomes runnable while preserving their evidence."""
+        statuses = ("needs_review", "insufficient_evidence", "failed")
+        params: list[Any] = list(statuses)
+        where = "status IN (?,?,?)"
+        if stage:
+            where += " AND stage=?"
+            params.append(stage)
+        selected = [int(value) for value in media_ids] if media_ids is not None else None
+        if selected is not None:
+            if not selected:
+                return {}, 0
+            where += f" AND media_id IN ({','.join('?' for _ in selected)})"
+            params.extend(selected)
+        rows = self.conn.execute(
+            f"SELECT media_id,stage,status,details_json,tool_version FROM stages WHERE {where}",
+            params,
+        ).fetchall()
+        touched: dict[int, list[str]] = {}
+        for row in rows:
+            try:
+                previous = json.loads(row["details_json"] or "{}")
+            except Exception:
+                previous = {}
+            self.set_stage(
+                int(row["media_id"]),
+                str(row["stage"]),
+                StageStatus.PENDING,
+                {
+                    "retry_scope": "reviewed_only",
+                    "previous_status": str(row["status"]),
+                    "previous_review": previous,
+                },
+                row["tool_version"],
+            )
+            touched.setdefault(int(row["media_id"]), []).append(str(row["stage"]))
+        for media_id in touched:
+            self.conn.execute(
+                "UPDATE media SET overall_status='incomplete',last_error=NULL WHERE id=?",
+                (media_id,),
+            )
+        self.conn.commit()
+        return touched, len(rows)
+
     def set_override(self, media_id: int, key: str, value: str) -> None:
         self.conn.execute(
             """INSERT INTO overrides(media_id,key,value) VALUES(?,?,?)

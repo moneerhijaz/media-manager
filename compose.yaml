@@ -1,0 +1,20 @@
+services:
+  media-manager:
+    build:
+      context: .
+      args:
+        INSTALL_AVSYNC: "1"
+    image: stateful-media-manager:local
+    init: true
+    volumes:
+      - "${MEDIA_LIBRARY:?Set MEDIA_LIBRARY to the absolute media-library path}:/library"
+    ports:
+      - "${MEDIA_MANAGER_BIND:-0.0.0.0}:${MEDIA_MANAGER_PORT:-8787}:8787"
+    stop_grace_period: 45s
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/healthz', timeout=3).read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

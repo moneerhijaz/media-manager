@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .avsync import AVSYNC_ALGORITHM_VERSION, analyze_av_sync, apply_verified_av_correction, classify_visual_type
+from .avsync import (
+    AVSYNC_ALGORITHM_VERSION,
+    analyze_av_sync,
+    apply_verified_av_correction,
+    classify_visual_type,
+    evaluate_saved_observations,
+)
 from .checkpoints import CheckpointStore, source_signature
 from .config import LibraryConfig
 from .crop import CROP_ALGORITHM_VERSION, analyze_crop, apply_crop
@@ -77,11 +83,33 @@ def _stage_needs_work(name: str, stage_row) -> bool:
         return True
     details = _details(stage_row)
     expected = _expected_stage_version(name)
+    # v8 evidence remains opt-in for the v9 review policy. This avoids silently
+    # reprocessing a completed library; `rerun-reviewed` performs the upgrade.
+    if name == "av_sync" and details.get("algorithm_version") == "avsync-v8-syncnet-adapter-fix":
+        return False
+    if (
+        name.startswith("subtitle:")
+        and details.get("algorithm_version") == "subtitle-v5-full-runtime-primary"
+    ):
+        return False
     if expected is not None and details.get("algorithm_version") != expected:
         return True
     if name == "av_sync" and stage_row["status"] == StageStatus.INSUFFICIENT_EVIDENCE.value:
         return str(details.get("reason") or "").startswith("Visual type is unknown")
     return False
+
+
+def _stage_selected(cfg: LibraryConfig, media_id: int, stage: str) -> bool:
+    selected = cfg.data.get("_runtime", {}).get("selected_stages")
+    if not isinstance(selected, dict):
+        return True
+    stages = selected.get(str(media_id), selected.get(media_id, []))
+    if stage in stages:
+        return True
+    # A real A/V correction invalidates subtitle timing and final verification.
+    # Those dependencies must be allowed to run if the selected A/V retry
+    # changes the media, while unrelated successful stages remain untouched.
+    return "av_sync" in stages and (stage.startswith("subtitle:") or stage == "final_verify")
 
 def _refresh_after_write(cfg: LibraryConfig, db: Database, media_id: int, path: Path) -> None:
     p = probe_media(path)
@@ -290,6 +318,8 @@ def _overall(db: Database, media_id: int, subtitle_languages: list[str]) -> str:
 
 def _visual_stage(path: Path, row, cfg: LibraryConfig, db: Database, ui: ProgressDisplay | None = None) -> VisualType:
     media_id = int(row["id"])
+    if not _stage_selected(cfg, media_id, "visual_type"):
+        return VisualType(db.get_media(media_id)["visual_type"])
     override = db.get_override(media_id, "visual_type")
     if override:
         visual = VisualType(override)
@@ -317,7 +347,11 @@ def _visual_stage(path: Path, row, cfg: LibraryConfig, db: Database, ui: Progres
 
 def _av_stage(path: Path, row, cfg: LibraryConfig, db: Database, work: Path, visual: VisualType, ui: ProgressDisplay | None = None) -> None:
     media_id = int(row["id"])
+    if not _stage_selected(cfg, media_id, "av_sync"):
+        return
     existing_av = db.get_stage(media_id, "av_sync")
+    existing_details = _details(existing_av) if existing_av else {}
+    saved_review = existing_details.get("previous_review") if existing_details.get("retry_scope") == "reviewed_only" else None
     retry_legacy_unknown = False
     if existing_av and existing_av["status"] == StageStatus.INSUFFICIENT_EVIDENCE.value:
         previous = _details(existing_av)
@@ -339,19 +373,32 @@ def _av_stage(path: Path, row, cfg: LibraryConfig, db: Database, work: Path, vis
     }, __version__)
     try:
         probe = probe_media(path)
-        analysis = analyze_av_sync(
-            path, probe, cfg.root, cfg["av_sync"], visual,
-            checkpoint_store=checkpoints, work_dir=work, progress=progress,
-        )
+        analysis = None
+        if isinstance(saved_review, dict):
+            analysis = evaluate_saved_observations(
+                saved_review, cfg["av_sync"], duration=probe.duration, visual_type=visual
+            )
+            if analysis is not None:
+                analysis.diagnostics["review_retry"] = "reused_saved_syncnet_observations"
+                progress({"phase": "analysis_complete", "message": "Re-evaluated saved SyncNet evidence"})
+        if analysis is None:
+            analysis = analyze_av_sync(
+                path, probe, cfg.root, cfg["av_sync"], visual,
+                checkpoint_store=checkpoints, work_dir=work, progress=progress,
+            )
         details = asdict(analysis)
         details["status"] = analysis.status.value
         details["algorithm_version"] = AVSYNC_ALGORITHM_VERSION
-        if analysis.status != StageStatus.COMPLETE:
-            db.set_stage(media_id, "av_sync", analysis.status, details, __version__)
+        if analysis.status == StageStatus.INSUFFICIENT_EVIDENCE:
+            # An inconclusive lip-sync check is a verification gap, not proof
+            # that the media needs repair. Preserve all evidence for inspection.
+            details["analysis_status"] = analysis.status.value
+            details["status"] = StageStatus.UNAVAILABLE.value
+            db.set_stage(media_id, "av_sync", StageStatus.UNAVAILABLE, details, __version__)
             checkpoints.clear("av_sync")
             return
-        if visual in {VisualType.ANIMATION, VisualType.MIXED} and not cfg["av_sync"].get("auto_correct_animation", False):
-            db.set_stage(media_id, "av_sync", StageStatus.NEEDS_REVIEW, {**details, "reason": f"SyncNet found a consistent offset, but automatic correction is disabled for visual type {visual.value}"}, __version__)
+        if analysis.status != StageStatus.COMPLETE:
+            db.set_stage(media_id, "av_sync", analysis.status, details, __version__)
             checkpoints.clear("av_sync")
             return
         if not cfg["av_sync"].get("apply_corrections", True):
@@ -415,6 +462,8 @@ def _av_stage(path: Path, row, cfg: LibraryConfig, db: Database, work: Path, vis
 
 def _crop_stage(path: Path, row, cfg: LibraryConfig, db: Database, work: Path, ui: ProgressDisplay | None = None) -> None:
     media_id = int(row["id"])
+    if not _stage_selected(cfg, media_id, "crop"):
+        return
     existing_crop = db.get_stage(media_id, "crop")
     if not _stage_needs_work("crop", existing_crop):
         return
@@ -499,6 +548,8 @@ def _subtitle_stages(path: Path, row, cfg: LibraryConfig, db: Database, work: Pa
     checkpoints = CheckpointStore(cfg.state_dir, media_id)
     for language in cfg["subtitles"].get("languages", ["en"]):
         stage = f"subtitle:{language}"
+        if not _stage_selected(cfg, media_id, stage):
+            continue
         if not _stage_needs_work(stage, db.get_stage(media_id, stage)):
             continue
         cp = checkpoints.load(stage)
@@ -637,12 +688,13 @@ def process_one(cfg: LibraryConfig, db: Database, row, client: OpenSubtitlesClie
         _subtitle_stages(path, db.get_media(media_id), cfg, db, work, client, ui, stage_start_index=4, stage_total=stage_total)
         if ui is not None:
             ui.stage("verify", stage_index=stage_total, stage_total=stage_total, message="final ffprobe/integrity verification")
-        final_probe = probe_media(path)
-        db.set_stage(media_id, "final_verify", StageStatus.COMPLETE, {
-            "duration": final_probe.duration, "video_codec": final_probe.video_codec,
-            "width": final_probe.width, "height": final_probe.height,
-            "audio_streams": len(final_probe.audio_streams),
-        }, __version__)
+        if _stage_selected(cfg, media_id, "final_verify"):
+            final_probe = probe_media(path)
+            db.set_stage(media_id, "final_verify", StageStatus.COMPLETE, {
+                "duration": final_probe.duration, "video_codec": final_probe.video_codec,
+                "width": final_probe.width, "height": final_probe.height,
+                "audio_streams": len(final_probe.audio_streams),
+            }, __version__)
         status = _overall(db, media_id, [str(x) for x in cfg["subtitles"].get("languages", ["en"])])
         final_status = status
         db.set_overall(media_id, status)
@@ -755,6 +807,8 @@ def scan_and_run(
     verbose: bool = False,
     client: OpenSubtitlesClient | None = None,
     progress_enabled: bool = True,
+    scan: bool = True,
+    media_ids: list[int] | None = None,
 ) -> dict[str, int]:
     ui = ProgressDisplay(enabled=None if progress_enabled else False)
     if client is not None:
@@ -763,13 +817,22 @@ def scan_and_run(
         # its renderer cannot erase the question and leave the run apparently
         # hung while getpass waits for input.
         client.password_prompt = ui.prompt_secret
-    ui.scan("Scanning Movies/ and TV Shows/ recursively")
-    try:
-        scan_library(cfg, db, verbose=False)
-    except Exception:
-        ui.close()
-        raise
-    rows = db.rows("present=1")
+    if scan:
+        ui.scan("Scanning Movies/ and TV Shows/ recursively")
+        try:
+            scan_library(cfg, db, verbose=False)
+        except Exception:
+            ui.close()
+            raise
+    else:
+        ui.scan("Using reviewed items already recorded in the database (library scan skipped)")
+    if media_ids is None:
+        rows = db.rows("present=1")
+    elif not media_ids:
+        rows = []
+    else:
+        placeholders = ",".join("?" for _ in media_ids)
+        rows = db.rows(f"present=1 AND id IN ({placeholders})", media_ids)
     # managed_with_gaps/review/failed have terminal stage records and therefore run cheaply;
     # keep them in the queue only if they still contain genuinely pending stages.
     pending = []
@@ -786,6 +849,7 @@ def scan_and_run(
         if cfg["subtitles"].get("enabled", True) and not runtime.get("skip_subtitles"):
             enabled_names += [f"subtitle:{x}" for x in cfg["subtitles"].get("languages", ["en"])]
         enabled_names.append("final_verify")
+        enabled_names = [name for name in enabled_names if _stage_selected(cfg, int(row["id"]), name)]
         if any(_stage_needs_work(name, stages.get(name)) for name in enabled_names):
             pending.append(row)
     if limit is not None:

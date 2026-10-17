@@ -44,7 +44,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "shift_all_audio_streams": False,
         "allow_unknown_visual_type": True,
         "attempt_animation_analysis": True,
-        "auto_correct_animation": False,
+        # Retained for compatibility with older config files. Visual type is
+        # informational in v0.6+; SyncNet evidence and sign validation decide.
+        "auto_correct_animation": True,
         "visual_sample_count": 96,
         "syncnet_device": "cpu",
         "syncnet_ffmpeg_timeout_seconds": 180.0,
@@ -92,6 +94,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "large_scale_delta": 0.015,
         "known_rate_ratio_tolerance": 0.003,
         "regional_activity_min_overlap": 0.25,
+        "alternative_recovery": True,
+        # Small out-of-order cues are sometimes intentional (for overlapping
+        # dialogue/signs). Large jumps usually mean multiple releases were
+        # concatenated and must be rejected before synchronization.
+        "max_backward_jump_seconds": 10.0,
+        # Includes the first provider result; rejected IDs/hashes are persisted
+        # so later runs continue with a different release.
+        "alternative_candidate_limit": 3,
     },
     "opensubtitles": {
         "username": "",

@@ -335,6 +335,116 @@ def test_runtime_invalid_full_result_falls_back_to_multi_segment(monkeypatch, tm
     assert result["candidate_validation"]["valid"] is True
 
 
+def test_srt_inspection_rejects_large_backward_timeline_jump(tmp_path):
+    source = tmp_path / "concatenated.srt"
+    source.write_text(
+        "1\n00:20:00,000 --> 00:20:02,000\nFirst release ending\n\n"
+        "2\n00:20:05,000 --> 00:20:07,000\nCredits\n\n"
+        "3\n00:12:00,000 --> 00:12:02,000\nSecond release begins\n",
+        encoding="utf-8",
+    )
+
+    inspection = engine._inspect_srt(source, 1800.0)
+
+    assert inspection["valid"] is False
+    assert inspection["backward_jump_count"] == 1
+    assert inspection["largest_backward_jump_seconds"] == 485.0
+    assert "concatenated or duplicated releases" in inspection["structural_error"]
+
+
+def test_structurally_corrupt_cached_download_is_quarantined_before_ffsubsync(monkeypatch, tmp_path):
+    video = tmp_path / "Example (2026).mp4"
+    video.write_bytes(b"video")
+    work = tmp_path / "work"
+    work.mkdir()
+    cached = work / "downloaded.en.srt"
+    cached.write_text(
+        "1\n00:20:00,000 --> 00:20:02,000\nEnding\n\n"
+        "2\n00:20:05,000 --> 00:20:07,000\nCredits\n\n"
+        "3\n00:12:00,000 --> 00:12:02,000\nRepeated section\n",
+        encoding="utf-8",
+    )
+    (work / "downloaded.en.json").write_text(
+        '{"file_id": 41, "file_name": "candidate.srt", "release": "release"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(engine, "_extract_embedded_text_subtitle", lambda *args: (None, None))
+    monkeypatch.setattr(
+        engine,
+        "_run_ffsubsync",
+        lambda *args, **kwargs: pytest.fail("ffsubsync must not receive malformed input"),
+    )
+
+    status, details, candidate = engine.process_subtitle_language(
+        video,
+        {"duration": 1800.0, "media_type": "movie", "title": "Example", "year": 2026,
+         "season": None, "episode": None},
+        "en", {"prefer_existing": True, "plain_srt_language": "en"}, None, work,
+    )
+
+    assert status == StageStatus.NEEDS_REVIEW
+    assert candidate is None
+    assert details["classification"] == "SUBTITLE_STRUCTURAL_CORRUPTION"
+    assert not cached.exists()
+    assert Path(details["retained_candidate_path"]).exists()
+    rejected = (work / "rejected.en.json").read_text(encoding="utf-8")
+    assert '"file_id": 41' in rejected
+
+
+def test_corrupt_legacy_cache_skips_same_bytes_and_installs_next_valid_candidate(monkeypatch, tmp_path):
+    video = tmp_path / "Example (2026).mp4"
+    video.write_bytes(b"x" * 200000)
+    work = tmp_path / "work"
+    work.mkdir()
+    corrupt = (
+        b"1\n00:20:00,000 --> 00:20:02,000\nEnding\n\n"
+        b"2\n00:20:05,000 --> 00:20:07,000\nCredits\n\n"
+        b"3\n00:12:00,000 --> 00:12:02,000\nRepeated section\n"
+    )
+    valid = (
+        b"1\n00:00:01,000 --> 00:00:02,000\nOne\n\n"
+        b"2\n00:00:03,000 --> 00:00:04,000\nTwo\n\n"
+        b"3\n00:00:05,000 --> 00:00:06,000\nThree\n"
+    )
+    (work / "downloaded.en.srt").write_bytes(corrupt)
+    results = [
+        _result(title="Example", feature_type="Movie", release="same-bad-file", file_id=41, hash_match=True),
+        _result(title="Example", feature_type="Movie", release="different-release", file_id=42),
+    ]
+    downloaded = []
+
+    class Client:
+        def configured(self): return True
+        def search(self, **kwargs): return results
+        def download(self, file_id):
+            downloaded.append(file_id)
+            return (corrupt if file_id == 41 else valid), f"{file_id}.srt", 97
+
+    def fake_sync(video, source, output, cfg, reference_audio_index, **kwargs):
+        output.write_bytes(source.read_bytes())
+        return {
+            "score": 100.0, "offset_seconds": 0.0, "scale": 1.0,
+            "quality_rejected": False, "low_quality": False,
+        }
+
+    monkeypatch.setattr(engine, "opensubtitles_hash", lambda path: ("hash", path.stat().st_size))
+    monkeypatch.setattr(engine, "_extract_embedded_text_subtitle", lambda *args: (None, None))
+    monkeypatch.setattr(engine, "_reference_audio_index", lambda *args: (0, "only_audio_stream"))
+    monkeypatch.setattr(engine, "_run_ffsubsync", fake_sync)
+
+    status, details, candidate = engine.process_subtitle_language(
+        video,
+        {"duration": 1800.0, "media_type": "movie", "title": "Example", "year": 2026,
+         "show_title": None, "season": None, "episode": None},
+        "en", {"prefer_existing": True, "plain_srt_language": "en"}, Client(), work,
+    )
+
+    assert status == StageStatus.COMPLETE
+    assert candidate is not None and candidate.read_bytes() == valid
+    assert details["opensubtitles"]["file_id"] == 42
+    assert downloaded == [41, 42]
+
+
 def test_ffsubsync_negative_score_without_safe_noop_still_fails(monkeypatch, tmp_path):
     source = tmp_path / "candidate.en.srt"
     source.write_text("subtitle", encoding="utf-8")
@@ -435,7 +545,7 @@ def test_existing_subtitle_is_not_replaced_after_low_quality_noop(monkeypatch, t
     assert not (work / "synced.en.srt").exists()
 
 
-def test_cached_download_is_retained_but_not_installed_after_low_quality_noop(monkeypatch, tmp_path):
+def test_cached_download_is_quarantined_but_not_installed_after_low_quality_noop(monkeypatch, tmp_path):
     video = tmp_path / "Movie (2026).mp4"
     video.write_bytes(b"video")
     work = tmp_path / "work"
@@ -466,9 +576,10 @@ def test_cached_download_is_retained_but_not_installed_after_low_quality_noop(mo
 
     assert status == StageStatus.NEEDS_REVIEW
     assert commit_candidate is None
-    assert cached.read_bytes() == original
+    assert not cached.exists()
     assert details["source"] == "opensubtitles_cached"
-    assert details["retained_candidate_path"] == str(cached)
+    retained = Path(details["retained_candidate_path"])
+    assert retained.read_bytes() == original
     assert not video.with_name("Movie (2026).en.srt").exists()
     assert not (work / "synced.en.srt").exists()
 
@@ -594,3 +705,85 @@ def test_runtime_regression_is_review_and_does_not_replace_plausible_source(monk
     assert details["classification"] == "FFSUBSYNC_RUNTIME_REGRESSION"
     assert details["source_validation"]["valid"] is True
     assert existing.read_bytes() == original
+
+
+def test_failed_existing_subtitle_can_try_one_provider_alternative(monkeypatch, tmp_path):
+    from media_manager.models import SubtitleCandidate
+
+    video = tmp_path / "Example (2026).mp4"
+    video.write_bytes(b"x" * 200000)
+    work = tmp_path / "work"
+    work.mkdir()
+    choice = SubtitleCandidate(
+        42, "candidate.srt", "en", "release", 100.0, True, True, False,
+        "Example", 2026, "movie", None, None, None,
+    )
+
+    class Client:
+        def configured(self): return True
+        def search(self, **kwargs): return [{}]
+        def download(self, file_id): return b"subtitle", "candidate.srt", 99
+
+    monkeypatch.setattr(engine, "opensubtitles_hash", lambda path: ("hash", path.stat().st_size))
+    monkeypatch.setattr(engine, "choose_candidate", lambda results, row, path: choice)
+    monkeypatch.setattr(engine, "_unpack", lambda raw, name: b"1\n00:00:01,000 --> 00:00:02,000\nText\n")
+    seen = {}
+
+    def fake_process(*args, **kwargs):
+        seen.update(kwargs)
+        return StageStatus.COMPLETE, {"source": "opensubtitles_alternative"}, work / "synced.en.srt"
+
+    monkeypatch.setattr(engine, "process_subtitle_language", fake_process)
+    result = engine._attempt_alternative_recovery(
+        video,
+        {"media_type": "movie", "title": "Example", "year": 2026,
+         "show_title": None, "season": None, "episode": None},
+        "en", {}, Client(), work, "existing", {"classification": "low"},
+    )
+    assert result is not None and result[0] == StageStatus.COMPLETE
+    assert seen["_forced_source"][1] == "opensubtitles_alternative"
+    assert seen["_recovery_context"]["initial_source"] == "existing"
+
+
+def test_alternative_recovery_excludes_persistently_rejected_provider_id(monkeypatch, tmp_path):
+    video = tmp_path / "Example (2026).mp4"
+    video.write_bytes(b"x" * 200000)
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "rejected.en.json").write_text(
+        '{"version": 1, "rejections": [{"file_id": 41, "sha256": "old"}]}\n',
+        encoding="utf-8",
+    )
+    results = [
+        _result(title="Example", feature_type="Movie", release="wrong", file_id=41, hash_match=True),
+        _result(title="Example", feature_type="Movie", release="alternate", file_id=42),
+    ]
+    downloaded = []
+
+    class Client:
+        def configured(self): return True
+        def search(self, **kwargs): return results
+        def download(self, file_id):
+            downloaded.append(file_id)
+            return b"subtitle", "alternate.srt", 98
+
+    monkeypatch.setattr(engine, "opensubtitles_hash", lambda path: ("hash", path.stat().st_size))
+    monkeypatch.setattr(
+        engine, "_unpack",
+        lambda raw, name: b"1\n00:00:01,000 --> 00:00:02,000\nText\n",
+    )
+    monkeypatch.setattr(
+        engine,
+        "process_subtitle_language",
+        lambda *args, **kwargs: (StageStatus.COMPLETE, {"source": "alternate"}, work / "synced.en.srt"),
+    )
+
+    result = engine._attempt_alternative_recovery(
+        video,
+        {"media_type": "movie", "title": "Example", "year": 2026,
+         "show_title": None, "season": None, "episode": None},
+        "en", {}, Client(), work, "opensubtitles_cached", {"classification": "rejected"},
+    )
+
+    assert result is not None and result[0] == StageStatus.COMPLETE
+    assert downloaded == [42]

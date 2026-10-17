@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import getpass
 import gzip
+import hashlib
 import io
 import json
 import math
@@ -25,8 +26,9 @@ from ..utils import MediaManagerError, require_tool, run
 
 APP_NAME = "MediaManager"
 APP_VERSION = __version__
-SUBTITLE_ALGORITHM_VERSION = "subtitle-v5-full-runtime-primary"
+SUBTITLE_ALGORITHM_VERSION = "subtitle-v7-structural-recovery"
 SRT_RUNTIME_TOLERANCE_SECONDS = 120.0
+SRT_BACKWARD_JUMP_TOLERANCE_SECONDS = 10.0
 
 
 class QuotaExhausted(MediaManagerError):
@@ -274,6 +276,145 @@ def _unpack(raw: bytes, preferred: str | None = None) -> bytes:
     return raw
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _candidate_summary(choice: SubtitleCandidate) -> dict[str, Any]:
+    return {
+        "file_id": choice.file_id,
+        "file_name": choice.file_name,
+        "release": choice.release,
+        "hash_match": choice.hash_match,
+        "trusted": choice.trusted,
+        "score": choice.score,
+    }
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _write_json_object(path: Path, value: dict[str, Any]) -> None:
+    temp = path.with_name(f".{path.name}.tmp")
+    temp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temp.replace(path)
+
+
+def _cached_candidate_metadata_path(work: Path, language: str) -> Path:
+    return work / f"downloaded.{language}.json"
+
+
+def _rejected_candidates_path(work: Path, language: str) -> Path:
+    return work / f"rejected.{language}.json"
+
+
+def _write_cached_candidate_metadata(
+    work: Path, language: str, choice: SubtitleCandidate, source: Path
+) -> None:
+    value = _candidate_summary(choice)
+    value["sha256"] = _sha256_file(source)
+    _write_json_object(_cached_candidate_metadata_path(work, language), value)
+
+
+def _load_rejected_candidates(work: Path, language: str) -> tuple[set[int], set[str]]:
+    payload = _read_json_object(_rejected_candidates_path(work, language))
+    file_ids: set[int] = set()
+    hashes: set[str] = set()
+    for item in payload.get("rejections", []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            if item.get("file_id") is not None:
+                file_ids.add(int(item["file_id"]))
+        except (TypeError, ValueError):
+            pass
+        sha256 = item.get("sha256")
+        if isinstance(sha256, str) and sha256:
+            hashes.add(sha256)
+    return file_ids, hashes
+
+
+def _quarantine_provider_candidate(
+    source: Path,
+    work: Path,
+    language: str,
+    choice: SubtitleCandidate | None,
+    reason: str,
+) -> dict[str, Any]:
+    """Preserve a rejected provider file while preventing automatic reuse."""
+    sha256 = _sha256_file(source)
+    cached_meta_path = _cached_candidate_metadata_path(work, language)
+    cached_meta = _read_json_object(cached_meta_path)
+    summary = _candidate_summary(choice) if choice is not None else cached_meta
+    file_id = summary.get("file_id")
+    try:
+        file_id = int(file_id) if file_id is not None else None
+    except (TypeError, ValueError):
+        file_id = None
+
+    rejected_path = work / f"rejected.{language}.{sha256[:12]}.srt"
+    if source.parent == work:
+        if rejected_path.exists():
+            if source != rejected_path:
+                source.unlink(missing_ok=True)
+        elif source != rejected_path:
+            source.replace(rejected_path)
+    else:
+        shutil.copyfile(source, rejected_path)
+
+    payload_path = _rejected_candidates_path(work, language)
+    payload = _read_json_object(payload_path)
+    rejections = payload.get("rejections")
+    if not isinstance(rejections, list):
+        rejections = []
+    entry = {
+        "sha256": sha256,
+        "file_id": file_id,
+        "file_name": summary.get("file_name"),
+        "release": summary.get("release"),
+        "reason": reason,
+        "path": str(rejected_path),
+    }
+    rejections = [
+        item for item in rejections
+        if not isinstance(item, dict)
+        or not (
+            item.get("sha256") == sha256
+            or (file_id is not None and item.get("file_id") == file_id)
+        )
+    ]
+    rejections.append(entry)
+    _write_json_object(payload_path, {"version": 1, "rejections": rejections})
+    cached_meta_path.unlink(missing_ok=True)
+    return entry
+
+
+def _exclude_provider_results(results: list[dict], file_ids: set[int]) -> list[dict]:
+    if not file_ids:
+        return results
+    filtered: list[dict] = []
+    for result in results:
+        files = (result.get("attributes") or {}).get("files") or []
+        candidate_ids: set[int] = set()
+        for item in files:
+            try:
+                candidate_ids.add(int((item or {}).get("file_id")))
+            except (TypeError, ValueError):
+                continue
+        if not candidate_ids.intersection(file_ids):
+            filtered.append(result)
+    return filtered
+
+
 
 def _language_aliases(language: str) -> set[str]:
     table = {
@@ -467,17 +608,48 @@ def _run_ffsubsync(
     return fallback
 
 
-def _inspect_srt(path: Path, duration: float) -> dict[str, Any]:
+def _inspect_srt(
+    path: Path,
+    duration: float,
+    *,
+    backward_jump_tolerance: float = SRT_BACKWARD_JUMP_TOLERANCE_SECONDS,
+) -> dict[str, Any]:
     data = path.read_text(encoding="utf-8", errors="replace")
     cues = len(re.findall(r"(?m)^\d+\s*$", data))
     timestamps = re.findall(r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s+-->\s+(\d{2}):(\d{2}):(\d{2})[,.](\d{3})", data)
+    starts = []
     ends = []
     for ts in timestamps:
-        h, m, s, ms = map(int, ts[4:])
-        ends.append(h * 3600 + m * 60 + s + ms / 1000)
+        values = list(map(int, ts))
+        starts.append(values[0] * 3600 + values[1] * 60 + values[2] + values[3] / 1000)
+        ends.append(values[4] * 3600 + values[5] * 60 + values[6] + values[7] / 1000)
     last = max(ends) if ends else 0
+    invalid_duration_count = sum(end <= start for start, end in zip(starts, ends))
+    backward_jumps = [
+        {
+            "after_timestamp": index,
+            "from_seconds": round(previous, 3),
+            "to_seconds": round(current, 3),
+            "jump_seconds": round(previous - current, 3),
+        }
+        for index, (previous, current) in enumerate(zip(starts, starts[1:]), start=1)
+        if current < previous - backward_jump_tolerance
+    ]
+    largest_backward_jump = max(
+        (float(item["jump_seconds"]) for item in backward_jumps), default=0.0
+    )
+    structural_error = None
+    if invalid_duration_count:
+        structural_error = f"Subtitle has {invalid_duration_count} cue(s) whose end is not after its start"
+    elif backward_jumps:
+        structural_error = (
+            "Subtitle timeline jumps backward "
+            f"{largest_backward_jump:.1f}s; it may contain concatenated or duplicated releases"
+        )
     error = None
-    if cues < 3 or len(timestamps) < 3:
+    if structural_error:
+        error = structural_error
+    elif cues < 3 or len(timestamps) < 3:
         error = "Subtitle has too few valid cues"
     elif last > duration + SRT_RUNTIME_TOLERANCE_SECONDS:
         error = f"Subtitle extends {last-duration:.1f}s beyond media duration"
@@ -487,6 +659,11 @@ def _inspect_srt(path: Path, duration: float) -> dict[str, Any]:
         "last_cue_seconds": last,
         "media_duration_seconds": duration,
         "overrun_seconds": round(last - duration, 3),
+        "invalid_duration_count": invalid_duration_count,
+        "backward_jump_count": len(backward_jumps),
+        "largest_backward_jump_seconds": round(largest_backward_jump, 3),
+        "backward_jumps": backward_jumps[:10],
+        "structural_error": structural_error,
         "valid": error is None,
         "error": error,
     }
@@ -613,57 +790,123 @@ def process_subtitle_language(
     cfg: dict,
     client: OpenSubtitlesClient | None,
     work: Path,
+    *,
+    _forced_source: tuple[Path, str, SubtitleCandidate, int | None] | None = None,
+    _recovery_context: dict[str, Any] | None = None,
 ) -> tuple[StageStatus, dict[str, Any], Path | None]:
     final = video.with_name(f"{video.stem}.{language}.srt")
     existing = _find_existing(video, language, str(cfg.get("plain_srt_language", "en"))) if cfg.get("prefer_existing", True) else None
-    source = existing
-    source_kind = "existing" if existing else "opensubtitles"
+    source = _forced_source[0] if _forced_source else existing
+    source_kind = _forced_source[1] if _forced_source else ("existing" if existing else "opensubtitles")
     embedded_info = None
-    if source is None and cfg.get("prefer_existing", True):
+    if source is None and cfg.get("prefer_existing", True) and _forced_source is None:
         embedded, embedded_info = _extract_embedded_text_subtitle(video, language, work)
         if embedded is not None:
             source = embedded
             source_kind = "embedded"
-    choice: SubtitleCandidate | None = None
-    remaining = None
+    choice: SubtitleCandidate | None = _forced_source[2] if _forced_source else None
+    remaining = _forced_source[3] if _forced_source else None
+    cached_candidate_metadata: dict[str, Any] = {}
 
     # Preserve a successfully downloaded OpenSubtitles file across Ctrl+C,
     # SSH disconnects, or reboots. This is especially important because a
     # repeated download would consume quota even though ffsubsync had not yet
     # finished.
     cached_download = work / f"downloaded.{language}.srt"
-    if source is None and cached_download.exists() and cached_download.stat().st_size > 0:
+    if source is None and _forced_source is None and cached_download.exists() and cached_download.stat().st_size > 0:
         source = cached_download
         source_kind = "opensubtitles_cached"
+        cached_candidate_metadata = _read_json_object(
+            _cached_candidate_metadata_path(work, language)
+        )
 
     if source is None:
         if client is None or not client.configured():
             return StageStatus.UNAVAILABLE, {"reason": "OpenSubtitles is not configured and no existing subtitle was found"}, None
         try:
             h, size = opensubtitles_hash(video)
+            rejected_file_ids, _ = _load_rejected_candidates(work, language)
             results = client.search(
                 language=language, media_type=row["media_type"], moviehash=h, moviebytesize=size,
                 season=row["season"], episode=row["episode"], hearing_impaired=str(cfg.get("hearing_impaired", "exclude")),
             )
-            choice = choose_candidate(results, row, video)
+            choice = choose_candidate(
+                _exclude_provider_results(results, rejected_file_ids), row, video
+            )
             if choice is None:
                 query = row["show_title"] if row["media_type"] == "episode" else row["title"]
                 results = client.search(
                     language=language, media_type=row["media_type"], query=query, year=row["year"],
                     season=row["season"], episode=row["episode"], hearing_impaired=str(cfg.get("hearing_impaired", "exclude")),
                 )
-                choice = choose_candidate(results, row, video)
+                choice = choose_candidate(
+                    _exclude_provider_results(results, rejected_file_ids), row, video
+                )
             if choice is None:
                 return StageStatus.UNAVAILABLE, {"reason": "No validated OpenSubtitles match"}, None
             raw, name, remaining = client.download(choice.file_id)
             source = work / f"downloaded.{language}.srt"
             source.write_bytes(_unpack(raw, name or choice.file_name))
+            _write_cached_candidate_metadata(work, language, choice, source)
         except QuotaExhausted:
             raise
 
     assert source is not None
     duration = float(row["duration"])
-    source_validation = _inspect_srt(source, duration)
+    backward_jump_tolerance = float(
+        cfg.get("max_backward_jump_seconds", SRT_BACKWARD_JUMP_TOLERANCE_SECONDS)
+    )
+    source_validation = _inspect_srt(
+        source, duration, backward_jump_tolerance=backward_jump_tolerance
+    )
+    if source_validation.get("structural_error"):
+        existing_preserved = source_kind == "existing"
+        downloaded = source_kind.startswith("opensubtitles")
+        rejection = None
+        if downloaded:
+            rejection = _quarantine_provider_candidate(
+                source,
+                work,
+                language,
+                choice,
+                str(source_validation["structural_error"]),
+            )
+        details: dict[str, Any] = {
+            "language": language,
+            "source": source_kind,
+            "source_path": str(source) if existing_preserved else None,
+            "source_validation": source_validation,
+            "validation": None,
+            "remaining_downloads": remaining,
+            "severity": "PRESERVED_UNVERIFIED" if existing_preserved else "CANDIDATE_REJECTED",
+            "classification": "SUBTITLE_STRUCTURAL_CORRUPTION",
+            "original_preserved": existing_preserved,
+            "source_preserved": existing_preserved or rejection is not None,
+            "candidate_installed": False,
+            "output_committed": False,
+            "retained_candidate_path": rejection.get("path") if rejection else None,
+            "rejected_candidate": rejection,
+            "reason": str(source_validation["structural_error"]),
+            "adjustment_validation": {
+                "reason": "Structurally invalid subtitles are rejected before ffsubsync"
+            },
+            "algorithm_version": SUBTITLE_ALGORITHM_VERSION,
+        }
+        provider_details = (
+            _candidate_summary(choice)
+            if choice is not None
+            else cached_candidate_metadata
+        )
+        if provider_details:
+            details["opensubtitles"] = provider_details
+        if _recovery_context:
+            details["alternative_recovery"] = _recovery_context
+            details["original_preserved"] = True
+        recovered = _attempt_alternative_recovery(
+            video, row, language, cfg, client, work, source_kind, details
+        )
+        return recovered if recovered is not None else (StageStatus.NEEDS_REVIEW, details, None)
+
     temp_out = work / f"synced.{language}.srt"
     reference_audio_index, reference_audio_reason = _reference_audio_index(video, language)
     if reference_audio_index is None:
@@ -687,6 +930,15 @@ def process_subtitle_language(
     if runtime_rejected:
         existing_preserved = source_kind == "existing"
         downloaded = source_kind.startswith("opensubtitles")
+        rejection = None
+        if downloaded:
+            rejection = _quarantine_provider_candidate(
+                source,
+                work,
+                language,
+                choice,
+                str(srt_info["error"]),
+            )
         source_was_invalid = not source_validation["valid"]
         classification = (
             "SUBTITLE_RELEASE_RUNTIME_MISMATCH"
@@ -720,7 +972,8 @@ def process_subtitle_language(
             "source_preserved": True,
             "candidate_installed": False,
             "output_committed": False,
-            "retained_candidate_path": str(source) if downloaded else None,
+            "retained_candidate_path": rejection.get("path") if rejection else None,
+            "rejected_candidate": rejection,
             "reason": reason,
             "adjustment_validation": {
                 "reason": "No runtime-invalid synchronization candidate may be committed",
@@ -732,15 +985,30 @@ def process_subtitle_language(
                 "file_id": choice.file_id, "release": choice.release, "hash_match": choice.hash_match,
                 "trusted": choice.trusted, "score": choice.score,
             }
+        if _recovery_context:
+            details["alternative_recovery"] = _recovery_context
+            details["original_preserved"] = True
         temp_out.unlink(missing_ok=True)
-        return StageStatus.NEEDS_REVIEW, details, None
+        recovered = _attempt_alternative_recovery(
+            video, row, language, cfg, client, work, source_kind, details
+        )
+        return recovered if recovered is not None else (StageStatus.NEEDS_REVIEW, details, None)
     if sync_info.get("quality_rejected") or sync_info.get("low_quality"):
         existing_preserved = source_kind == "existing"
         downloaded = source_kind.startswith("opensubtitles")
+        rejection = None
+        if downloaded:
+            rejection = _quarantine_provider_candidate(
+                source,
+                work,
+                language,
+                choice,
+                str(sync_info.get("low_quality_reason") or "ffsubsync rejected the alignment"),
+            )
         if existing_preserved:
             action = "Existing subtitle was preserved unchanged"
         elif downloaded:
-            action = "Downloaded subtitle was retained in work storage but not installed"
+            action = "Downloaded subtitle was quarantined in work storage and not installed"
         else:
             action = "Embedded subtitle was left unchanged and no external sidecar was installed"
         reason = (
@@ -764,7 +1032,8 @@ def process_subtitle_language(
             "source_preserved": True,
             "candidate_installed": False,
             "output_committed": False,
-            "retained_candidate_path": str(source) if downloaded else None,
+            "retained_candidate_path": rejection.get("path") if rejection else None,
+            "rejected_candidate": rejection,
             "reason": reason,
             "adjustment_validation": {
                 "reason": "No timing adjustment was evaluated because ffsubsync rejected the alignment",
@@ -776,11 +1045,17 @@ def process_subtitle_language(
                 "file_id": choice.file_id, "release": choice.release, "hash_match": choice.hash_match,
                 "trusted": choice.trusted, "score": choice.score,
             }
+        if _recovery_context:
+            details["alternative_recovery"] = _recovery_context
+            details["original_preserved"] = True
         # ffsubsync's safety mode writes a copy of the unchanged input to its
         # requested output path.  It is not a synchronization candidate and
         # must never be mistaken for one by a later interrupted run.
         temp_out.unlink(missing_ok=True)
-        return StageStatus.NEEDS_REVIEW, details, None
+        recovered = _attempt_alternative_recovery(
+            video, row, language, cfg, client, work, source_kind, details
+        )
+        return recovered if recovered is not None else (StageStatus.NEEDS_REVIEW, details, None)
 
     severity, adjustment_validation = _subtitle_adjustment_severity(
         video, temp_out, sync_info, reference_audio_index, float(row["duration"]), cfg
@@ -805,7 +1080,145 @@ def process_subtitle_language(
             "file_id": choice.file_id, "release": choice.release, "hash_match": choice.hash_match,
             "trusted": choice.trusted, "score": choice.score,
         }
+    if _recovery_context:
+        details["alternative_recovery"] = _recovery_context
+        details["original_preserved"] = True
     if severity == "NEEDS_REVIEW":
         details["reason"] = adjustment_validation.get("reason")
         return StageStatus.NEEDS_REVIEW, details, temp_out
     return StageStatus.COMPLETE, details, temp_out
+
+
+def _attempt_alternative_recovery(
+    video: Path,
+    row,
+    language: str,
+    cfg: dict,
+    client: OpenSubtitlesClient | None,
+    work: Path,
+    source_kind: str,
+    initial_details: dict[str, Any],
+) -> tuple[StageStatus, dict[str, Any], Path | None] | None:
+    """Try another provider subtitle, excluding every candidate already rejected."""
+    if (
+        not bool(cfg.get("alternative_recovery", True))
+        or client is None
+        or not client.configured()
+    ):
+        return None
+    try:
+        prior_context = initial_details.get("alternative_recovery")
+        if not isinstance(prior_context, dict):
+            prior_context = {}
+        attempted_file_ids: set[int] = set()
+        for value in prior_context.get("attempted_file_ids", []):
+            try:
+                attempted_file_ids.add(int(value))
+            except (TypeError, ValueError):
+                pass
+        current_provider = initial_details.get("opensubtitles")
+        if isinstance(current_provider, dict) and current_provider.get("file_id") is not None:
+            try:
+                attempted_file_ids.add(int(current_provider["file_id"]))
+            except (TypeError, ValueError):
+                pass
+
+        candidate_limit = max(1, int(cfg.get("alternative_candidate_limit", 3)))
+        if len(attempted_file_ids) >= candidate_limit:
+            initial_details["alternative_recovery"] = {
+                "attempted": True,
+                "result": "candidate_limit_reached",
+                "attempted_file_ids": sorted(attempted_file_ids),
+                "candidate_limit": candidate_limit,
+            }
+            return StageStatus.NEEDS_REVIEW, initial_details, None
+
+        rejected_file_ids, rejected_hashes = _load_rejected_candidates(work, language)
+        excluded_file_ids = rejected_file_ids | attempted_file_ids
+        moviehash, size = opensubtitles_hash(video)
+        results = client.search(
+            language=language,
+            media_type=row["media_type"],
+            moviehash=moviehash,
+            moviebytesize=size,
+            season=row["season"],
+            episode=row["episode"],
+            hearing_impaired=str(cfg.get("hearing_impaired", "exclude")),
+        )
+        choice = choose_candidate(
+            _exclude_provider_results(results, excluded_file_ids), row, video
+        )
+        if choice is None:
+            query = row["show_title"] if row["media_type"] == "episode" else row["title"]
+            results = client.search(
+                language=language,
+                media_type=row["media_type"],
+                query=query,
+                year=row["year"],
+                season=row["season"],
+                episode=row["episode"],
+                hearing_impaired=str(cfg.get("hearing_impaired", "exclude")),
+            )
+            choice = choose_candidate(
+                _exclude_provider_results(results, excluded_file_ids), row, video
+            )
+        if choice is None:
+            initial_details["alternative_recovery"] = {
+                "attempted": True,
+                "result": "no_untried_provider_match",
+                "attempted_file_ids": sorted(attempted_file_ids),
+                "excluded_file_ids": sorted(rejected_file_ids),
+                "candidate_limit": candidate_limit,
+            }
+            return StageStatus.NEEDS_REVIEW, initial_details, None
+        raw, name, remaining = client.download(choice.file_id)
+        alternative = work / f"alternative.{language}.srt"
+        alternative.write_bytes(_unpack(raw, name or choice.file_name))
+        attempted_file_ids.add(choice.file_id)
+        alternative_sha256 = _sha256_file(alternative)
+        if alternative_sha256 in rejected_hashes:
+            _quarantine_provider_candidate(
+                alternative,
+                work,
+                language,
+                choice,
+                "Provider returned bytes matching an already rejected subtitle",
+            )
+            initial_details["alternative_recovery"] = {
+                "attempted": True,
+                "result": "duplicate_rejected_candidate",
+                "attempted_file_ids": sorted(attempted_file_ids),
+                "candidate_limit": candidate_limit,
+            }
+            return _attempt_alternative_recovery(
+                video, row, language, cfg, client, work, source_kind, initial_details
+            )
+        result = process_subtitle_language(
+            video,
+            row,
+            language,
+            cfg,
+            client,
+            work,
+            _forced_source=(alternative, "opensubtitles_alternative", choice, remaining),
+            _recovery_context={
+                "attempted": True,
+                "result": "provider_candidate_evaluated",
+                "initial_source": source_kind,
+                "initial_classification": initial_details.get("classification"),
+                "initial_reason": initial_details.get("reason"),
+                "attempted_file_ids": sorted(attempted_file_ids),
+                "candidate_limit": candidate_limit,
+                "candidate": _candidate_summary(choice),
+            },
+        )
+        return result
+    except QuotaExhausted:
+        raise
+    except Exception as exc:
+        initial_details["alternative_recovery"] = {
+            "attempted": True,
+            "result": "provider_error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+        return StageStatus.NEEDS_REVIEW, initial_details, None

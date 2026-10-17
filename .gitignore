@@ -46,6 +46,9 @@ wheelhouse/
 venv/
 
 # Local reports, scratch data, and archives
+/archive/
+/docs/
+/content-filter-benchmark/
 artifacts/
 test-artifacts/
 logs/

@@ -4,9 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stateful-media-manager"
-version = "0.5.3"
+version = "0.6.0"
 description = "Stateful Plex-style media QA and repair manager"
-readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 dependencies = ["ffsubsync>=0.5.1", "numpy>=1.26"]

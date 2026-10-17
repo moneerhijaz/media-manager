@@ -30,7 +30,7 @@ from ..utils import MediaManagerError, require_tool, run
 
 SILENCE_START_RE = re.compile(r"silence_start:\s*([0-9.]+)")
 SILENCE_END_RE = re.compile(r"silence_end:\s*([0-9.]+)")
-AVSYNC_ALGORITHM_VERSION = "avsync-v8-syncnet-adapter-fix"
+AVSYNC_ALGORITHM_VERSION = "avsync-v9-robust-policy"
 
 
 class SyncNetAdapterError(MediaManagerError):
@@ -331,7 +331,7 @@ def _speech_candidates(segments: list[tuple[float, float]], duration: float, cfg
     """
     win = float(cfg["candidate_seconds"])
     bins = max(12, int(cfg.get("runtime_bins", 24)))
-    target = max(1, int(cfg.get("face_candidate_count", max(48, int(cfg.get("candidate_max_count", 64)) * 2))))
+    target = max(1, int(cfg.get("face_candidate_count", 48)), int(cfg.get("candidate_max_count", cfg.get("face_candidate_count", 64))))
     step = max(2.0, win * 0.5)
     raw: list[tuple[float, float]] = []
     max_start = max(0.0, duration - win)
@@ -1053,17 +1053,96 @@ def _make_analysis_clip(path: Path, start: float, seconds: float, audio_index: i
     ])
 
 
-def _linear_drift(observations: list[AVObservation]) -> float:
+def _robust_drift(observations: list[AVObservation], duration: float) -> tuple[float, dict[str, Any]]:
+    """Estimate drift without allowing one bad SyncNet window to dominate."""
+    ordered = sorted(observations, key=lambda item: item.time)
+    evidence: dict[str, Any] = {
+        "method": "theil_sen_with_early_late_confirmation",
+        "observation_count": len(ordered),
+        "runtime_seconds": float(duration),
+        "actionable": False,
+    }
+    if len(ordered) < 3:
+        return 0.0, evidence
+    slopes: list[float] = []
+    for i, left in enumerate(ordered):
+        for right in ordered[i + 1:]:
+            elapsed = right.time - left.time
+            if elapsed > 0:
+                slopes.append(((right.offset_frames - left.offset_frames) * 40.0 / elapsed) * 3600.0)
+    drift = statistics.median(slopes) if slopes else 0.0
+    span = max(0.0, ordered[-1].time - ordered[0].time)
+    group_size = max(1, len(ordered) // 3)
+    early = statistics.median(item.offset_frames * 40.0 for item in ordered[:group_size])
+    late = statistics.median(item.offset_frames * 40.0 for item in ordered[-group_size:])
+    delta = late - early
+    coverage = span / max(float(duration), 1.0)
+    direction_confirmed = delta == 0.0 or drift == 0.0 or (delta > 0) == (drift > 0)
+    actionable = len(ordered) >= 5 and span >= 300.0 and coverage >= 0.5 and direction_confirmed
+    evidence.update({
+        "span_seconds": span,
+        "coverage_fraction": coverage,
+        "early_median_ms": early,
+        "late_median_ms": late,
+        "early_late_delta_ms": delta,
+        "direction_confirmed": direction_confirmed,
+        "actionable": actionable,
+    })
+    return drift, evidence
+
+
+def evaluate_saved_observations(
+    data: dict[str, Any], cfg: dict, *, duration: float, visual_type: VisualType
+) -> AVAnalysis | None:
+    """Apply current policy to saved SyncNet evidence without rerunning SyncNet."""
+    observations = [
+        _av_observation_from_dict(item)
+        for item in (data.get("observations") or [])
+        if isinstance(item, dict)
+    ]
+    observations = [item for item in observations
+                    if all(math.isfinite(value) for value in (item.time, item.offset_frames, item.confidence))
+                    and item.confidence >= float(cfg["min_confidence"])]
     if len(observations) < 3:
-        return 0.0
-    xs = [x.time for x in observations]
-    ys = [x.offset_frames * 40.0 for x in observations]  # SyncNet convention is 25 fps.
-    xm, ym = statistics.mean(xs), statistics.mean(ys)
-    denom = sum((x - xm) ** 2 for x in xs)
-    if denom <= 0:
-        return 0.0
-    slope_ms_per_sec = sum((x - xm) * (y - ym) for x, y in zip(xs, ys)) / denom
-    return slope_ms_per_sec * 3600.0
+        return None
+    offsets_ms = [item.offset_frames * 40.0 for item in observations]
+    median_ms = statistics.median(offsets_ms)
+    median_frames = statistics.median(item.offset_frames for item in observations)
+    mad = statistics.median(abs(value - median_ms) for value in offsets_ms)
+    spread = mad * 1.4826
+    drift, drift_evidence = _robust_drift(observations, duration)
+    diagnostics = dict(data.get("diagnostics") or {})
+    diagnostics["drift_evidence"] = drift_evidence
+    confidence = statistics.median(item.confidence for item in observations)
+    if drift_evidence["actionable"] and abs(drift) > float(cfg["max_drift_ms_per_hour"]):
+        status = StageStatus.NEEDS_REVIEW
+        why = f"Progressive drift detected ({drift:.1f} ms/hour)"
+    elif spread > float(cfg["max_spread_ms"]):
+        status = StageStatus.NEEDS_REVIEW
+        why = f"SyncNet observations disagree (robust spread {spread:.1f} ms)"
+    elif abs(median_ms) <= float(cfg["not_needed_threshold_ms"]):
+        status = StageStatus.NOT_NEEDED
+        why = "A/V offset is within configured tolerance"
+    elif abs(median_ms) > float(cfg["max_auto_offset_ms"]):
+        status = StageStatus.NEEDS_REVIEW
+        why = f"Offset {median_ms:.1f} ms exceeds automatic correction limit"
+    else:
+        status = StageStatus.COMPLETE
+        why = "Consistent high-confidence global A/V offset"
+    return AVAnalysis(
+        status=status,
+        observations=observations,
+        median_offset_frames=median_frames,
+        median_offset_ms=median_ms,
+        spread_ms=spread,
+        drift_ms_per_hour=drift,
+        confidence=confidence,
+        reason=(why + f"; visual_type={visual_type.value}; visual classification is informational; "
+                "SyncNet/S3FD evidence is authoritative"),
+        reference_audio_index=(int(data["reference_audio_index"])
+                               if data.get("reference_audio_index") is not None else None),
+        diagnostics=diagnostics,
+    )
 
 
 def _av_observation_from_dict(data: dict[str, Any]) -> AVObservation:
@@ -1450,7 +1529,20 @@ def analyze_av_sync(
                     checkpoint_store.save("av_sync", cp)
                 break
             if tested_this_policy >= initial_target and diag_now["high_confidence"] >= 3:
-                break
+                strong_offsets = [
+                    float(item["offset_frames"]) * 40.0
+                    for item in sync_results.values()
+                    if item.get("ok") and float(item.get("confidence", 0.0)) >= threshold
+                ]
+                suspicious_variation = (
+                    len(strong_offsets) >= 3
+                    and max(strong_offsets) - min(strong_offsets) > float(cfg["max_spread_ms"])
+                )
+                # Consistent evidence can stop at three. If those observations
+                # suggest disagreement/drift, gather five before applying the
+                # coverage-gated robust policy instead of trusting a 3-point fit.
+                if not suspicious_variation or diag_now["high_confidence"] >= 5:
+                    break
 
         cp["syncnet_diagnostics"] = _syncnet_diagnostics(
             sync_results, threshold, cp.get("syncnet_failure_catalog")
@@ -1552,42 +1644,18 @@ def analyze_av_sync(
             checkpoint_store.save("av_sync", cp)
         return result
 
-    offsets_ms = [o.offset_frames * 40.0 for o in observations]
-    median_ms = statistics.median(offsets_ms)
-    median_frames = statistics.median(o.offset_frames for o in observations)
-    mad = statistics.median(abs(x - median_ms) for x in offsets_ms)
-    spread = mad * 1.4826
-    drift = _linear_drift(observations)
-    conf = statistics.median(o.confidence for o in observations)
-
-    if abs(drift) > float(cfg["max_drift_ms_per_hour"]):
-        status = StageStatus.NEEDS_REVIEW
-        why = f"Progressive drift detected ({drift:.1f} ms/hour)"
-    elif spread > float(cfg["max_spread_ms"]):
-        status = StageStatus.NEEDS_REVIEW
-        why = f"SyncNet observations disagree (robust spread {spread:.1f} ms)"
-    elif abs(median_ms) <= float(cfg["not_needed_threshold_ms"]):
-        status = StageStatus.NOT_NEEDED
-        why = "A/V offset is within configured tolerance"
-    elif abs(median_ms) > float(cfg["max_auto_offset_ms"]):
-        status = StageStatus.NEEDS_REVIEW
-        why = f"Offset {median_ms:.1f} ms exceeds automatic correction limit"
-    else:
-        status = StageStatus.COMPLETE
-        why = "Consistent high-confidence global A/V offset"
-
-    result = AVAnalysis(
-        status=status,
-        observations=observations,
-        median_offset_frames=median_frames,
-        median_offset_ms=median_ms,
-        spread_ms=spread,
-        drift_ms_per_hour=drift,
-        confidence=conf,
-        reason=why + f"; speech selector={speech_method}; visual_type={visual_type.value}; face selector is a hint, SyncNet/S3FD is authoritative",
-        reference_audio_index=audio_index,
-        diagnostics=diagnostics,
+    result = evaluate_saved_observations(
+        {
+            "observations": [asdict(item) for item in observations],
+            "reference_audio_index": audio_index,
+            "diagnostics": diagnostics,
+        },
+        cfg,
+        duration=probe.duration,
+        visual_type=visual_type,
     )
+    assert result is not None
+    result.reason = (result.reason or "") + f"; speech selector={speech_method}; face selector is a hint"
     cp["phase"] = "analysis_complete"
     cp["final_analysis"] = {**asdict(result), "status": result.status.value}
     if checkpoint_store:
@@ -1614,35 +1682,78 @@ def _verify_shift_sign(
     root: Path,
     cfg: dict,
     work: Path,
-) -> float:
+) -> tuple[float, dict[str, Any]]:
     if not analysis.observations or analysis.median_offset_ms is None or analysis.reference_audio_index is None:
         raise MediaManagerError("Insufficient A/V analysis for correction")
     backend = SyncNetBackend(root, cfg)
-    best_obs = max(analysis.observations, key=lambda o: o.confidence)
-    source_clip = work / "sign-source.mkv"
-    _make_analysis_clip(input_path, best_obs.time, float(cfg["candidate_seconds"]), analysis.reference_audio_index, source_clip)
+    ordered = sorted(analysis.observations, key=lambda item: item.time)
+    selected: list[AVObservation] = []
+    indexed = list(enumerate(ordered))
+    for target in (0.0, 0.5, 1.0):
+        target_index = round(target * (len(ordered) - 1))
+        pool = sorted(indexed, key=lambda pair: (abs(pair[0] - target_index), -pair[1].confidence))
+        choice = next((item for _, item in pool if item not in selected), None)
+        if choice is not None:
+            selected.append(choice)
     magnitude = abs(analysis.median_offset_ms) / 1000.0
-    trials: list[tuple[float, float, float]] = []
-    for shift in (-magnitude, magnitude):
-        shifted = work / ("sign-neg.mkv" if shift < 0 else "sign-pos.mkv")
-        _shift_audio_copy(source_clip, shifted, shift)
-        try:
-            evaluation = backend.evaluate(shifted)
-            if evaluation is None:
-                continue
-            off, conf, _ = evaluation
-            trials.append((shift, abs(off * 40.0), conf))
-        except Exception:
-            continue
-    if not trials:
-        raise MediaManagerError("Could not validate either A/V correction direction")
-    shift, residual, conf = min(trials, key=lambda x: x[1])
-    original_abs = abs(best_obs.offset_frames * 40.0)
-    if residual >= original_abs * 0.65 or conf < float(cfg["min_confidence"]):
-        raise MediaManagerError(
-            f"Proposed A/V correction did not validate (original {original_abs:.1f} ms, residual {residual:.1f} ms)"
+    trials: dict[float, list[dict[str, Any]]] = {-magnitude: [], magnitude: []}
+    for clip_index, observation in enumerate(selected):
+        source_clip = work / f"sign-source-{clip_index}.mkv"
+        _make_analysis_clip(
+            input_path, observation.time, float(cfg["candidate_seconds"]),
+            analysis.reference_audio_index, source_clip,
         )
-    return shift
+        original_abs = abs(observation.offset_frames * 40.0)
+        for shift in (-magnitude, magnitude):
+            shifted = work / f"sign-{clip_index}-{'neg' if shift < 0 else 'pos'}.mkv"
+            _shift_audio_copy(source_clip, shifted, shift)
+            record: dict[str, Any] = {
+                "time": observation.time,
+                "original_ms": original_abs,
+                "shift_seconds": shift,
+            }
+            try:
+                evaluation = backend.evaluate(shifted)
+                if evaluation is None:
+                    record["error"] = "no usable speaking-face result"
+                else:
+                    off, conf, _ = evaluation
+                    residual = abs(off * 40.0)
+                    record.update({
+                        "residual_ms": residual,
+                        "confidence": conf,
+                        "improved": residual < original_abs * 0.65,
+                        "confident": conf >= float(cfg["min_confidence"]),
+                    })
+            except Exception as exc:
+                record["error"] = f"{type(exc).__name__}: {exc}"
+            trials[shift].append(record)
+    usable = [shift for shift, records in trials.items() if any("residual_ms" in item for item in records)]
+    diagnostics = {"method": "distributed_three_clip_sign_validation", "trials": trials}
+    if not usable:
+        raise MediaManagerError("Could not validate either A/V correction direction")
+
+    def score(shift: float) -> tuple[int, float]:
+        records = [item for item in trials[shift] if "residual_ms" in item]
+        accepted = sum(bool(item.get("improved") and item.get("confident")) for item in records)
+        residual = statistics.median(float(item["residual_ms"]) for item in records)
+        return accepted, -residual
+
+    shift = max(usable, key=score)
+    required = min(2, len(selected))
+    accepted, negative_residual = score(shift)
+    diagnostics.update({
+        "selected_shift_seconds": shift,
+        "required_confirmations": required,
+        "confirmations": accepted,
+    })
+    if accepted < required:
+        raise MediaManagerError(
+            "Proposed A/V correction did not validate across distributed clips "
+            f"({accepted}/{required} confirmed; median residual {-negative_residual:.1f} ms; "
+            f"details={json.dumps(diagnostics, ensure_ascii=False)})"
+        )
+    return shift, diagnostics
 
 
 def apply_verified_av_correction(
@@ -1660,8 +1771,12 @@ def apply_verified_av_correction(
             "Multiple audio streams present; set av_sync.shift_all_audio_streams=true or review manually"
         )
     with tempfile.TemporaryDirectory(prefix="media-manager-avsign-") as td:
-        shift = _verify_shift_sign(input_path, analysis, probe, root, cfg, Path(td))
+        shift, validation = _verify_shift_sign(input_path, analysis, probe, root, cfg, Path(td))
     _shift_audio_copy(input_path, output_path, shift)
     if not output_path.exists() or output_path.stat().st_size == 0:
         raise MediaManagerError("A/V corrected output was not created")
-    return {"applied_shift_seconds": shift, "detected_offset_ms": analysis.median_offset_ms}
+    return {
+        "applied_shift_seconds": shift,
+        "detected_offset_ms": analysis.median_offset_ms,
+        "sign_validation": validation,
+    }
