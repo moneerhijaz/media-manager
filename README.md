@@ -73,6 +73,8 @@ media-manager run
 
 For an installation without SyncNet, use `pipx install .`, skip model setup, and run with `--no-av-sync`.
 
+The A/V extra installs a single OpenCV distribution, `opencv-contrib-python` 4.x, matching SyncNet. SceneDetect uses that same installation. `media-manager doctor` checks the bundled face detector; A/V-enabled Docker builds validate it automatically. Missing detector evidence is reported as unknown, never as “no face found.”
+
 ## Common commands
 
 Run from your media-library root:

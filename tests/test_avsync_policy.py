@@ -619,7 +619,7 @@ def test_syncnet_noncallable_public_export_exposes_hidden_import(monkeypatch, tm
     assert caught.value.phase == "syncnet_import"
     assert caught.value.classification == AVSyncClassification.BACKEND_UNAVAILABLE
     assert "scenedetect.video_manager" in str(caught.value)
-    assert "scenedetect[opencv]>=0.6,<0.7" in str(caught.value)
+    assert "scenedetect>=0.6,<0.7" in str(caught.value)
     assert "NoneType' object is not callable" not in str(caught.value)
 
 

@@ -1,4 +1,5 @@
-opencv-python-headless>=4.8
+# Match SyncNet's OpenCV distribution; never install overlapping cv2 wheels.
+opencv-contrib-python>=4.8,<5
 silero-vad>=6.0
-scenedetect[opencv]>=0.6,<0.7
+scenedetect>=0.6,<0.7
 syncnet-python

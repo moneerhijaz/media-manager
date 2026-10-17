@@ -917,6 +917,9 @@ def cmd_setup_syncnet(args) -> int:
 def cmd_doctor(args) -> int:
     cfg = _ensure_config(args, auto_init=False)
     checks = []
+    from .opencv_health import check as check_opencv
+    opencv_ok, opencv_message = check_opencv()
+    checks.append(("opencv:distribution-and-detector", opencv_ok, opencv_message))
     for tool in ("ffmpeg", "ffprobe", "ffsubsync"):
         checks.append((tool, bool(shutil.which(tool)), shutil.which(tool) or "missing"))
     if not shutil.which("ffsubsync"):

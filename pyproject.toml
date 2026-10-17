@@ -15,9 +15,9 @@ dependencies = ["ffsubsync>=0.5.1", "numpy>=1.26"]
 languages = ["faster-whisper>=1.2,<2"]
 avsync = [
   "numpy>=1.26",
-  "opencv-python-headless>=4.8",
+  "opencv-contrib-python>=4.8,<5",
   "silero-vad>=6.0",
-  "scenedetect[opencv]>=0.6,<0.7",
+  "scenedetect>=0.6,<0.7",
   "syncnet-python",
 ]
 dev = ["pytest>=8"]

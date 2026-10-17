@@ -20,6 +20,7 @@ RUN pip install -r requirements.txt \
 
 COPY . /app
 RUN pip install . --no-deps
+RUN if [ "$INSTALL_AVSYNC" = "1" ]; then python -m media_manager.opencv_health; fi
 
 COPY docker-entrypoint.sh /usr/local/bin/media-manager-entrypoint
 RUN chmod 0755 /usr/local/bin/media-manager-entrypoint

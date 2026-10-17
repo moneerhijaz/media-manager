@@ -19,6 +19,7 @@ import threading
 import time
 import traceback
 from dataclasses import asdict
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
@@ -68,7 +69,20 @@ def _extract_frame(path: Path, t: float, width: int = 320):
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
-def _frame_features(frame) -> tuple[float, float, float, bool]:
+@lru_cache(maxsize=1)
+def _face_cascade():
+    try:
+        import cv2
+        path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+        if not path.is_file():
+            return None
+        cascade = cv2.CascadeClassifier(str(path))
+        return None if cascade.empty() else cascade
+    except Exception:
+        return None
+
+
+def _frame_features(frame) -> tuple[float, float, float, bool | None]:
     """Return color complexity, edge density, texture variance, face-present."""
     import cv2
     import numpy as np
@@ -83,11 +97,12 @@ def _frame_features(frame) -> tuple[float, float, float, bool]:
     edges = cv2.Canny(gray, 80, 160)
     edge_density = float((edges > 0).mean())
     texture = min(1.0, float(cv2.Laplacian(gray, cv2.CV_64F).var()) / 1200.0)
-    face = False
+    face = None
     try:
-        cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-        faces = cascade.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=5, minSize=(24, 24))
-        face = len(faces) > 0
+        cascade = _face_cascade()
+        if cascade is not None:
+            faces = cascade.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=5, minSize=(24, 24))
+            face = len(faces) > 0
     except Exception:
         pass
     return complexity, edge_density, texture, face
@@ -103,7 +118,7 @@ def classify_visual_type(
     try:
         import cv2  # noqa: F401
     except ImportError:
-        return VisualType.UNKNOWN, 0.0, {"reason": "opencv-python-headless not installed"}
+        return VisualType.UNKNOWN, 0.0, {"reason": "opencv-contrib-python not installed"}
     count = max(72, int(cfg.get("visual_sample_count", 72)))
     times = [probe.duration * (i + 0.5) / count for i in range(count)]
     feats = []
@@ -115,6 +130,8 @@ def classify_visual_type(
             progress({"phase": "visual_sampling", "completed": i + 1, "total": count, "usable": len(feats)})
     if len(feats) < max(4, count // 4):
         return VisualType.UNKNOWN, 0.0, {"reason": "too few visual samples"}
+    if any(feature[3] is None for feature in feats):
+        return VisualType.UNKNOWN, 0.0, {"reason": "Face detector unavailable; run media-manager doctor", "samples": len(feats), "face_evidence_available": False}
     complexity = statistics.median(x[0] for x in feats)
     edges = statistics.median(x[1] for x in feats)
     texture = statistics.median(x[2] for x in feats)
@@ -922,7 +939,7 @@ class SyncNetBackend:
                     if isinstance(exc, ModuleNotFoundError) and exc.name == "scenedetect.video_manager":
                         hint = (
                             "; syncnet-python requires the legacy PySceneDetect VideoManager API "
-                            "(install 'scenedetect[opencv]>=0.6,<0.7')"
+                            "(install 'scenedetect>=0.6,<0.7')"
                         )
                     raise SyncNetAdapterError(
                         "syncnet-python exported a non-callable SyncNetPipeline because its internal "
