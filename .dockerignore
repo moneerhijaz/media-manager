@@ -2,6 +2,7 @@
 archive
 docs
 .env
+compose.override.yaml
 .env.*
 !.env.example
 *.pem

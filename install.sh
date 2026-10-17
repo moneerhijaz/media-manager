@@ -21,7 +21,7 @@ PY
 mkdir -p "$LIBDIR" "$BINDIR"
 rm -rf "$LIBDIR/media_manager"
 cp -a media_manager "$LIBDIR/media_manager"
-cp -f LICENSE pyproject.toml "$LIBDIR/"
+cp -f README.md LICENSE pyproject.toml "$LIBDIR/"
 
 cat > "$BINDIR/media-manager" <<EOF
 #!/usr/bin/env bash

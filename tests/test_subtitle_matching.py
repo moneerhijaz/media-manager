@@ -114,7 +114,7 @@ def test_ffsubsync_low_quality_noop_returns_diagnostics_instead_of_failure(monke
 
     monkeypatch.setattr(engine.shutil, "which", lambda name: "/test/ffsubsync")
 
-    def fake_run(command, check=False):
+    def fake_run(command, check=False, timeout=None):
         if "--help" in command:
             return SimpleNamespace(
                 returncode=0,
@@ -169,7 +169,7 @@ def test_ffsubsync_wrapped_low_quality_warning_is_recognized(monkeypatch, tmp_pa
     output = tmp_path / "synced.en.srt"
     monkeypatch.setattr(engine.shutil, "which", lambda name: "/test/ffsubsync")
 
-    def fake_run(command, check=False):
+    def fake_run(command, check=False, timeout=None):
         if "--help" in command:
             return SimpleNamespace(returncode=0, stdout="--skip-sync-on-low-quality", stderr="")
         output.write_bytes(source.read_bytes())
@@ -203,7 +203,7 @@ def test_ffsubsync_low_quality_full_runtime_falls_back_to_multi_segment(monkeypa
     commands = []
     monkeypatch.setattr(engine.shutil, "which", lambda name: "/test/ffsubsync")
 
-    def fake_run(command, check=False):
+    def fake_run(command, check=False, timeout=None):
         if "--help" in command:
             return SimpleNamespace(
                 returncode=0,
@@ -258,7 +258,7 @@ def test_ffsubsync_uses_full_runtime_without_multi_segment_when_primary_is_good(
     commands = []
     monkeypatch.setattr(engine.shutil, "which", lambda name: "/test/ffsubsync")
 
-    def fake_run(command, check=False):
+    def fake_run(command, check=False, timeout=None):
         if "--help" in command:
             return SimpleNamespace(returncode=0, stdout="--multi-segment-sync", stderr="")
         commands.append(command.copy())
@@ -295,7 +295,7 @@ def test_runtime_invalid_full_result_falls_back_to_multi_segment(monkeypatch, tm
     commands = []
     monkeypatch.setattr(engine.shutil, "which", lambda name: "/test/ffsubsync")
 
-    def fake_run(command, check=False):
+    def fake_run(command, check=False, timeout=None):
         if "--help" in command:
             return SimpleNamespace(returncode=0, stdout="--multi-segment-sync", stderr="")
         commands.append(command.copy())
@@ -445,13 +445,13 @@ def test_corrupt_legacy_cache_skips_same_bytes_and_installs_next_valid_candidate
     assert downloaded == [41, 42]
 
 
-def test_ffsubsync_negative_score_without_safe_noop_still_fails(monkeypatch, tmp_path):
+def test_ffsubsync_negative_score_is_rejected_candidate(monkeypatch, tmp_path):
     source = tmp_path / "candidate.en.srt"
     source.write_text("subtitle", encoding="utf-8")
     output = tmp_path / "synced.en.srt"
     monkeypatch.setattr(engine.shutil, "which", lambda name: "/test/ffsubsync")
 
-    def fake_run(command, check=False):
+    def fake_run(command, check=False, timeout=None):
         if "--help" in command:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         output.write_bytes(source.read_bytes())
@@ -462,12 +462,13 @@ def test_ffsubsync_negative_score_without_safe_noop_still_fails(monkeypatch, tmp
         )
 
     monkeypatch.setattr(engine, "run", fake_run)
-    with pytest.raises(MediaManagerError, match="score -1.0 below configured minimum"):
-        engine._run_ffsubsync(
+    result = engine._run_ffsubsync(
             tmp_path / "movie.mp4", source, output,
             {"ffsubsync_min_score": 0.0, "max_abs_offset_seconds": 600.0, "min_scale": 0.9, "max_scale": 1.1},
             0,
-        )
+    )
+    assert result["low_quality"]
+    assert not result["applied"]
 
 
 def test_ffsubsync_explicit_offset_quality_noop_is_not_a_hard_failure(monkeypatch, tmp_path):
@@ -476,7 +477,7 @@ def test_ffsubsync_explicit_offset_quality_noop_is_not_a_hard_failure(monkeypatc
     output = tmp_path / "synced.en.srt"
     monkeypatch.setattr(engine.shutil, "which", lambda name: "/test/ffsubsync")
 
-    def fake_run(command, check=False):
+    def fake_run(command, check=False, timeout=None):
         if "--help" in command:
             return SimpleNamespace(returncode=0, stdout="--skip-sync-on-low-quality", stderr="")
         output.write_bytes(source.read_bytes())

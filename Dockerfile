@@ -1,6 +1,7 @@
 FROM python:3.12-slim
 
 ARG INSTALL_AVSYNC=1
+ARG INSTALL_LANGUAGES=1
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -14,6 +15,7 @@ WORKDIR /app
 COPY requirements.txt requirements-avsync.txt /app/
 RUN pip install -r requirements.txt \
     && if [ "$INSTALL_AVSYNC" = "1" ]; then pip install -r requirements-avsync.txt; fi \
+    && if [ "$INSTALL_LANGUAGES" = "1" ]; then pip install 'faster-whisper>=1.2,<2'; fi \
     && mkdir -p "$HOME"
 
 COPY . /app
@@ -23,6 +25,6 @@ COPY docker-entrypoint.sh /usr/local/bin/media-manager-entrypoint
 RUN chmod 0755 /usr/local/bin/media-manager-entrypoint
 
 EXPOSE 8787
-VOLUME ["/library"]
+VOLUME ["/state"]
 ENTRYPOINT ["media-manager-entrypoint"]
-CMD ["media-manager", "web", "--library-root", "/library", "--host", "0.0.0.0", "--port", "8787"]
+CMD ["media-manager", "web", "--app-state", "/state", "--host", "0.0.0.0", "--port", "8787"]

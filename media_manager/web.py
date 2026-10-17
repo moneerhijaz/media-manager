@@ -56,7 +56,7 @@ function reviewTable(rows){if(!rows.length)return '<div class="empty">Everything
 function runTable(rows,compact=false){if(!rows.length)return '<div class="empty">No processing sessions have been recorded yet.</div>';return `<table class="data-table run-table${compact?' compact-table':''}"><thead><tr><th>Started</th><th>Status</th><th>Ended</th><th>Reason</th></tr></thead><tbody>${rows.map(r=>`<tr><td data-label="Started">${esc(r.started_at||'—')}</td><td data-label="Status"><span class="pill ${safeClass(r.status)}">${esc(label(r.status))}</span></td><td data-label="Ended">${esc(r.ended_at||'In progress')}</td><td data-label="Reason" class="reason-cell">${esc(r.reason||'—')}</td></tr>`).join('')}</tbody></table>`}
 function renderStats(counts){const cards=[['managed','Managed','ok'],['managed_with_gaps','With gaps','warn'],['needs_review','Review','warn'],['failed','Failed','bad']];$('stats').innerHTML=cards.map(([key,name,tone])=>`<div class="stat ${tone}"><span>${name}</span><b>${Number(counts[key]||0)}</b></div>`).join('')}
 function renderCurrent(d){const active=d.active_run,stage=d.current_stage;if(!active){$('runPill').className='pill';$('runPill').textContent='IDLE';$('currentRun').innerHTML='<div class="idle-box">No processing run is active.</div>';return}$('runPill').className='pill complete';$('runPill').textContent='RUNNING';const stageHtml=stage?`<div class="stage-box"><div class="stage-top"><span class="stage-path" title="${esc(stage.path)}">${esc(stage.path)}</span><span class="pill">${esc(label(stage.stage))}</span></div><div class="stage-name">${esc(label(stage.phase||'Working'))} · updated ${esc(stage.updated_at||'now')}</div><div class="progress-track"><span></span></div><details><summary class="muted">Technical details</summary><pre>${esc(JSON.stringify(stage.details,null,2))}</pre></details></div>`:'<div class="idle-box">Waiting for the next pipeline stage…</div>';$('currentRun').innerHTML=`<div class="run-summary"><span class="run-state-icon">▶</span><span><strong>Processing is active</strong><small>PID ${esc(active.pid)} · started ${esc(active.started_at)}</small></span></div>${stageHtml}`}
-function stageReason(stage){const d=stage.details||{};return d.reason||d.error||d.correction_error||d.message||''}
+function stageReason(stage){const d=stage.details||{};let reason=d.reason||d.error||d.correction_error||d.message||'';if(stage.status==='waiting')reason='Waiting for suitable subtitles. Next eligible retry: '+(d.next_eligible_attempt||'unknown')+'. '+reason;if(d.diagnostics?.drift_verified===false)reason+='; drift unverified';if(d.selection)reason+='; '+d.selection.reference_reason;return reason}
 function renderMediaDetail(d){const entries=Object.entries(d.stages||{}),passed=new Set(['complete','not_needed','not_applicable']),retryable=new Set(['failed','needs_review','insufficient_evidence']);let passCount=0,attentionCount=0;for(const [,s] of entries){if(passed.has(s.status))passCount++;else if(retryable.has(s.status)||s.status==='unavailable')attentionCount++}const otherCount=entries.length-passCount-attentionCount;const canRetry=entries.some(([,s])=>retryable.has(s.status));const stages=entries.length?entries.map(([name,s])=>{const reason=stageReason(s);return `<article class="stage-row"><div class="stage-row-head"><strong>${esc(label(name))}</strong><span class="pill ${safeClass(s.status)}">${esc(label(s.status))}</span></div>${reason?`<p class="stage-reason">${esc(reason)}</p>`:''}<p class="stage-reason">Updated ${esc(s.updated_at||'—')}</p><details><summary>Show recorded evidence</summary><pre>${esc(JSON.stringify(s.details||{},null,2))}</pre></details></article>`}).join(''):'<div class="empty">No pipeline stages have been recorded for this item.</div>';const events=(d.events||[]).slice(0,20).map(e=>`<div class="event-row"><span>${esc(e.created_at||'—')} · ${esc(label(e.kind))}</span><span>${esc(e.message||'')}</span></div>`).join('')||'<p class="muted">No events recorded.</p>';return `<div class="media-meta"><span class="pill ${safeClass(d.media.overall_status)}">${esc(label(d.media.overall_status))}</span><span>${esc(label(d.media.media_type))}</span><span>${d.media.duration?Math.round(Number(d.media.duration)/60)+' min':'Duration unavailable'}</span></div><div class="detail-summary"><div class="detail-stat ok"><span>Passed</span><b>${passCount}</b></div><div class="detail-stat bad"><span>Needs attention</span><b>${attentionCount}</b></div><div class="detail-stat"><span>Other</span><b>${otherCount}</b></div></div><div class="detail-run"><div><strong>Retry only this media item</strong><p>Successful stages stay preserved; only unsuccessful stages and required verification run again.</p></div><button class="button primary" onclick="runMedia(${Number(d.media.id)})" ${!canRetry||dashboardBusy?'disabled':''}>▶ Run only this item</button></div><p class="eyebrow">PIPELINE STAGES</p><div class="stage-list">${stages}</div><h3>Recent events</h3><div class="event-list">${events}</div>`}
 async function bootstrap(){const b=await api('/api/bootstrap',{},false);$('library').textContent=b.library;$('library').title=b.library;if(b.setup_required){$('setupFields').innerHTML=formFields(b.defaults,true);$('setup').hidden=false;$('login').hidden=true}else{$('setup').hidden=true;$('login').hidden=false;auth=sessionStorage.getItem('mediaManagerToken')||'';$('token').value=auth;if(auth)connect()}}
 async function submitSetup(){const msg=$('setupmsg');try{msg.textContent='Saving…';const d=formData($('setupFields'));await api('/api/setup',{method:'POST',body:JSON.stringify(d)},false);auth=d.dashboard_token;sessionStorage.setItem('mediaManagerToken',auth);$('setup').hidden=true;await connect();notify('Setup complete')}catch(e){msg.innerHTML='<span class="error">'+esc(e.message)+'</span>'}}
@@ -68,6 +68,42 @@ async function showMedia(id){try{const d=await api('/api/media?id='+encodeURICom
 async function runMedia(id){if(!confirm('Retry unsuccessful stages for only this media item?'))return;try{const d=await api('/api/actions/start',{method:'POST',body:JSON.stringify({mode:'single',media_id:id})});$('detail').close();notify(d.message);setTimeout(refresh,700)}catch(e){notify(e.message,true)}}
 async function openSettings(){try{const v=await api('/api/settings');$('settingsFields').innerHTML=formFields(v,false);$('settingsmsg').textContent='';$('settings').showModal()}catch(e){notify(e.message,true)}}
 async function saveSettings(){try{const d=formData($('settingsFields')),r=await api('/api/settings',{method:'POST',body:JSON.stringify(d)});if(d.dashboard_token){auth=d.dashboard_token;sessionStorage.setItem('mediaManagerToken',auth)}$('settingsmsg').textContent=r.message;notify(r.message)}catch(e){$('settingsmsg').innerHTML='<span class="error">'+esc(e.message)+'</span>'}}
+let selectedLibrary='',detailLibrary='';
+const singleLibraryApi=api;
+api=async function(path,opt={},authorized=true){
+  if(authorized&&path!=='/api/libraries'){
+    let library=selectedLibrary;
+    if(path.startsWith('/api/media')||(path==='/api/actions/start'&&opt.body&&JSON.parse(opt.body).mode==='single'))library=detailLibrary||selectedLibrary;
+    if(library)path+=(path.includes('?')?'&':'?')+'library='+encodeURIComponent(library);
+  }
+  return singleLibraryApi(path,opt,authorized);
+};
+const singleLibraryReviewTable=reviewTable;
+reviewTable=function(rows){return singleLibraryReviewTable(rows.map(r=>({...r,media_id:r.library_id?"'"+r.library_id+":"+Number(r.media_id)+"'":r.media_id})))};
+const singleLibraryShowMedia=showMedia;
+showMedia=async function(id){const parts=String(id).split(':');detailLibrary=parts.length===2?parts[0]:selectedLibrary;return singleLibraryShowMedia(Number(parts.at(-1)))};
+const singleLibraryRefresh=refresh;
+refresh=async function(){
+  await singleLibraryRefresh();
+  const data=await api('/api/libraries');
+  if(!$('librarySelect')){
+    const controls=document.createElement('div');controls.innerHTML='<label>Library <select id="librarySelect" aria-label="Library"></select></label><span id="libraryQueue" class="muted"></span>';
+    $('library').parentElement.appendChild(controls);
+    $('librarySelect').onchange=async function(){
+      const value=this.value,entry=this.selectedOptions[0];
+      if(entry.dataset.registered==='false'){
+        if(!confirm('Initialize a separate Media Manager library at this mounted root?')){this.value=selectedLibrary;return}
+        try{await api('/api/libraries',{method:'POST',body:JSON.stringify({library_id:value})})}catch(e){notify(e.message,true);this.value=selectedLibrary;return}
+      }
+      selectedLibrary=value;detailLibrary='';refresh().catch(e=>notify(e.message,true));
+    };
+  }
+  const select=$('librarySelect');
+  select.innerHTML='<option value="">Dashboard / default view</option><option value="all">All libraries — combined / queue all</option>'+data.libraries.map(l=>`<option value="${esc(l.id)}" data-registered="${l.registered}">${esc(l.path)}${l.registered?'':' — add library'}</option>`).join('');
+  select.value=selectedLibrary;
+  $('libraryQueue').textContent=data.error?' Queue stopped: '+data.error:data.busy?' Processing one library; '+data.pending.length+' queued.':'';
+  if(data.busy){dashboardBusy=true;['startReview','startFull','reviewPageRun'].forEach(id=>$(id).disabled=true);$('pause').disabled=false}
+};
 bootstrap().catch(e=>$('authmsg').textContent=e.message);setInterval(()=>{if(!$('app').hidden)refresh().catch(()=>{})},3000);
 </script></body></html>"""
 
@@ -356,7 +392,7 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _handler(dashboard: Dashboard):
+def _handler(dashboard: Dashboard, hub=None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "media-manager-dashboard"
 
@@ -392,33 +428,44 @@ def _handler(dashboard: Dashboard):
                 self._send_json(HTTPStatus.OK, dashboard.bootstrap()); return
             if not self._authorized(): return
             try:
+                library = parse_qs(parsed.query).get("library", [None])[0]
+                if parsed.path == "/api/libraries" and hub:
+                    self._send_json(HTTPStatus.OK, hub.listing()); return
                 if parsed.path == "/api/status":
-                    self._send_json(HTTPStatus.OK, dashboard.status()); return
+                    self._send_json(HTTPStatus.OK, hub.status(library) if hub else dashboard.status()); return
+                target = hub.target(library) if hub else dashboard
                 if parsed.path == "/api/settings":
-                    self._send_json(HTTPStatus.OK, dashboard.settings()); return
+                    self._send_json(HTTPStatus.OK, target.settings()); return
                 if parsed.path == "/api/media":
                     values = parse_qs(parsed.query).get("id", [])
                     if not values: raise MediaManagerError("Missing media id")
-                    self._send_json(HTTPStatus.OK, dashboard.media(int(values[0]))); return
+                    self._send_json(HTTPStatus.OK, target.media(int(values[0]))); return
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             except (MediaManagerError, KeyError, ValueError) as exc:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
         def do_POST(self) -> None:
+            parsed = urlparse(self.path)
             origin = self.headers.get("Origin")
             host = self.headers.get("Host")
             if origin and host and urlparse(origin).netloc != host:
                 self._send_json(HTTPStatus.FORBIDDEN, {"error": "Cross-origin request rejected"}); return
-            is_setup = self.path == "/api/setup"
+            is_setup = parsed.path == "/api/setup"
             if not is_setup and not self._authorized(): return
             try:
                 length = max(0, min(int(self.headers.get("Content-Length", "0") or 0), 65536))
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 if not isinstance(payload, dict): raise MediaManagerError("JSON body must be an object")
+                library = parse_qs(parsed.query).get("library", [None])[0]
                 if is_setup: result = dashboard.update_settings(payload, initial=True)
-                elif self.path == "/api/settings": result = dashboard.update_settings(payload)
-                elif self.path == "/api/actions/start": result = dashboard.start(payload)
-                elif self.path == "/api/actions/pause": result = dashboard.pause()
+                elif parsed.path == "/api/libraries" and hub: result = hub.add(payload)
+                elif parsed.path == "/api/settings":
+                    target = hub.target(library) if hub else dashboard
+                    if target is not dashboard and payload.get("dashboard_token"):
+                        raise MediaManagerError("Change the shared token from Dashboard / default view settings")
+                    result = target.update_settings(payload)
+                elif parsed.path == "/api/actions/start": result = hub.start(payload, library) if hub else dashboard.start(payload)
+                elif parsed.path == "/api/actions/pause": result = hub.pause(library) if hub else dashboard.pause()
                 else:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"}); return
                 self._send_json(HTTPStatus.OK, result)
@@ -470,7 +517,7 @@ def load_or_create_token(cfg: LibraryConfig, token_file: Path | None = None) -> 
     return "", path, True
 
 
-def serve(cfg: LibraryConfig, *, host: str, port: int, token_file: Path | None = None) -> None:
+def serve(cfg: LibraryConfig, *, host: str, port: int, token_file: Path | None = None, standalone: bool = False) -> None:
     token, path, setup_required = load_or_create_token(cfg, token_file)
     if path is not None:
         print(f"Dashboard token file: {path}")
@@ -478,7 +525,9 @@ def serve(cfg: LibraryConfig, *, host: str, port: int, token_file: Path | None =
         print("First-time dashboard setup is required in the browser")
     print(f"Dashboard: http://{host}:{port}")
     dashboard = Dashboard(cfg, token, token_path=path, setup_required=setup_required)
-    server = ThreadingHTTPServer((host, port), _handler(dashboard))
+    from .libraries import LibraryHub, configured_libraries
+    hub = LibraryHub(dashboard, configured_libraries(), standalone=standalone)
+    server = ThreadingHTTPServer((host, port), _handler(dashboard, hub))
     server.daemon_threads = True
     old_handler = signal.getsignal(signal.SIGTERM)
 
@@ -493,8 +542,8 @@ def serve(cfg: LibraryConfig, *, host: str, port: int, token_file: Path | None =
     finally:
         server.server_close()
         signal.signal(signal.SIGTERM, old_handler)
-        if dashboard._child is not None and dashboard._child.poll() is None:
+        if hub.worker is not None and hub.worker.is_alive():
             try:
-                dashboard.pause()
+                hub.pause()
             except Exception as exc:
                 print(f"Dashboard shutdown could not cleanly pause the child run: {exc}", file=sys.stderr)

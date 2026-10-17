@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import statistics
@@ -26,6 +27,10 @@ from .markers import update_marker
 from .models import StageStatus, VisualType
 from .probe import probe_media
 from .progress import ProgressDisplay
+from .retry_policy import eligible, waiting_details
+from .http_policy import ProviderDeferred
+from .movie_metadata import lookup as lookup_movie, reconcile_visual
+from .audio_languages import detect as detect_languages, selections as audio_selections, VERSION as LANGUAGE_VERSION
 from .scanner import scan_library
 from .subtitles import SUBTITLE_ALGORITHM_VERSION, OpenSubtitlesClient, QuotaExhausted, process_subtitle_language
 from .utils import MediaManagerError, atomic_replace
@@ -37,7 +42,7 @@ STAGE_OK = {
     StageStatus.NOT_NEEDED.value,
     StageStatus.NOT_APPLICABLE.value,
 }
-VISUAL_ALGORITHM_VERSION = "visual-v4-96frame"
+VISUAL_ALGORITHM_VERSION = "visual-v5-metadata"
 
 
 STAGE_BLOCK = {
@@ -67,6 +72,8 @@ def _stage_done(db: Database, media_id: int, stage: str) -> bool:
 
 
 def _expected_stage_version(name: str) -> str | None:
+    if name == "audio_languages":
+        return LANGUAGE_VERSION
     if name == "visual_type":
         return VISUAL_ALGORITHM_VERSION
     if name == "av_sync":
@@ -82,16 +89,18 @@ def _stage_needs_work(name: str, stage_row) -> bool:
     if stage_row is None or stage_row["status"] in {"pending", "running", "unknown"}:
         return True
     details = _details(stage_row)
+    if name == "visual_type" and details.get("metadata", {}).get("next_eligible_attempt"):
+        return eligible(details["metadata"])
+    if name == "visual_type" and bool(os.environ.get("TMDB_READ_TOKEN")) != bool(details.get("metadata", {}).get("configured")):
+        return True
+    if (name == "av_sync" or name.startswith("subtitle:")) and stage_row["status"] in STAGE_OK:
+        return False  # Policy upgrades never invalidate a successful correction.
+    if stage_row["status"] == StageStatus.WAITING.value:
+        return eligible(details)
+    if name == "av_sync" and details.get("correction_error"):
+        return False  # Failed independent validation still requires explicit review.
     expected = _expected_stage_version(name)
-    # v8 evidence remains opt-in for the v9 review policy. This avoids silently
-    # reprocessing a completed library; `rerun-reviewed` performs the upgrade.
-    if name == "av_sync" and details.get("algorithm_version") == "avsync-v8-syncnet-adapter-fix":
-        return False
-    if (
-        name.startswith("subtitle:")
-        and details.get("algorithm_version") == "subtitle-v5-full-runtime-primary"
-    ):
-        return False
+    # Completed stages are preserved; unresolved evidence can adopt new policy.
     if expected is not None and details.get("algorithm_version") != expected:
         return True
     if name == "av_sync" and stage_row["status"] == StageStatus.INSUFFICIENT_EVIDENCE.value:
@@ -311,6 +320,8 @@ def _overall(db: Database, media_id: int, subtitle_languages: list[str]) -> str:
         return "needs_review"
     if any(s == StageStatus.UNAVAILABLE.value for s in statuses):
         return "managed_with_gaps"
+    if any(s == StageStatus.WAITING.value for s in statuses):
+        return "managed_with_gaps"
     if statuses and all(s in STAGE_OK for s in statuses):
         return "managed"
     return "incomplete"
@@ -329,7 +340,7 @@ def _visual_stage(path: Path, row, cfg: LibraryConfig, db: Database, ui: Progres
     existing = db.get_stage(media_id, "visual_type")
     if existing and existing["status"] in STAGE_OK:
         previous = _details(existing)
-        if previous.get("algorithm_version") == VISUAL_ALGORITHM_VERSION:
+        if previous.get("algorithm_version") == VISUAL_ALGORITHM_VERSION and not _stage_needs_work("visual_type", existing):
             return VisualType(db.get_media(media_id)["visual_type"])
     probe = probe_media(path)
     def visual_progress(details: dict[str, Any]) -> None:
@@ -340,6 +351,10 @@ def _visual_stage(path: Path, row, cfg: LibraryConfig, db: Database, ui: Progres
                 message=f"sampling distributed frames ({details.get('usable', 0)} usable)",
             )
     visual, confidence, details = classify_visual_type(path, probe, cfg["av_sync"], progress=visual_progress)
+    metadata = lookup_movie(row, cfg["metadata"].get("region", "US"))
+    metadata["configured"] = bool(os.environ.get("TMDB_READ_TOKEN"))
+    visual, confidence = reconcile_visual(visual, confidence, metadata)
+    details["metadata"] = metadata
     db.set_visual_type(media_id, visual, confidence)
     db.set_stage(media_id, "visual_type", StageStatus.COMPLETE, {"type": visual.value, "confidence": confidence, "algorithm_version": VISUAL_ALGORITHM_VERSION, **details}, __version__)
     return visual
@@ -352,6 +367,8 @@ def _av_stage(path: Path, row, cfg: LibraryConfig, db: Database, work: Path, vis
     existing_av = db.get_stage(media_id, "av_sync")
     existing_details = _details(existing_av) if existing_av else {}
     saved_review = existing_details.get("previous_review") if existing_details.get("retry_scope") == "reviewed_only" else None
+    if saved_review is None and existing_details.get("observations") and not existing_details.get("correction_error"):
+        saved_review = existing_details
     retry_legacy_unknown = False
     if existing_av and existing_av["status"] == StageStatus.INSUFFICIENT_EVIDENCE.value:
         previous = _details(existing_av)
@@ -363,6 +380,36 @@ def _av_stage(path: Path, row, cfg: LibraryConfig, db: Database, work: Path, vis
     if not cfg["av_sync"].get("enabled", True):
         db.set_stage(media_id, "av_sync", StageStatus.NOT_APPLICABLE, {"reason": "disabled in library config", "algorithm_version": AVSYNC_ALGORITHM_VERSION}, __version__)
         return
+    visual_details = _details(db.get_stage(media_id, "visual_type"))
+    if visual == VisualType.ANIMATION and (visual_details.get("source") == "override" or
+            (visual_details.get("metadata", {}).get("animation_genre") and visual_details.get("confidence", 0) >= 0.8)):
+        db.set_stage(media_id, "av_sync", StageStatus.UNAVAILABLE, {
+            "reason": "A/V unverified (animation): human lip-sync verifier is unsuitable",
+            "verification_skipped": True, "algorithm_version": AVSYNC_ALGORITHM_VERSION}, __version__)
+        return
+    audio_details = _details(db.get_stage(media_id, "audio_languages"))
+    av_cfg = dict(cfg["av_sync"])
+    if audio_details:
+        reference = audio_details.get("selection", {}).get("av_reference_audio_index")
+        if reference is None:
+            retained = dict(existing_details)
+            status = StageStatus.UNAVAILABLE
+            if isinstance(saved_review, dict):
+                reevaluated = evaluate_saved_observations(saved_review, av_cfg, duration=float(row["duration"] or 0), visual_type=visual)
+                if reevaluated is not None:
+                    retained = asdict(reevaluated)
+                    if reevaluated.status == StageStatus.NEEDS_REVIEW:
+                        status = StageStatus.NEEDS_REVIEW
+            reason = audio_details.get("selection", {}).get("reference_reason", "Original audio unverified")
+            if retained.get("reason"):
+                reason += "; saved evidence: " + str(retained["reason"])
+            db.set_stage(media_id, "av_sync", status, {**retained, "status": status.value,
+                "reason": reason,
+                "algorithm_version": AVSYNC_ALGORITHM_VERSION, "verification_skipped": True}, __version__)
+            return
+        av_cfg["reference_audio_index"] = reference
+        if isinstance(saved_review, dict) and saved_review.get("reference_audio_index") != reference:
+            saved_review = None
     checkpoints = CheckpointStore(cfg.state_dir, media_id)
     if _resume_or_commit_journal(cfg, db, media_id, "av_sync", path, checkpoints):
         return
@@ -376,14 +423,14 @@ def _av_stage(path: Path, row, cfg: LibraryConfig, db: Database, work: Path, vis
         analysis = None
         if isinstance(saved_review, dict):
             analysis = evaluate_saved_observations(
-                saved_review, cfg["av_sync"], duration=probe.duration, visual_type=visual
+                saved_review, av_cfg, duration=probe.duration, visual_type=visual
             )
             if analysis is not None:
                 analysis.diagnostics["review_retry"] = "reused_saved_syncnet_observations"
                 progress({"phase": "analysis_complete", "message": "Re-evaluated saved SyncNet evidence"})
         if analysis is None:
             analysis = analyze_av_sync(
-                path, probe, cfg.root, cfg["av_sync"], visual,
+                path, probe, cfg.root, av_cfg, visual,
                 checkpoint_store=checkpoints, work_dir=work, progress=progress,
             )
         details = asdict(analysis)
@@ -550,6 +597,8 @@ def _subtitle_stages(path: Path, row, cfg: LibraryConfig, db: Database, work: Pa
         stage = f"subtitle:{language}"
         if not _stage_selected(cfg, media_id, stage):
             continue
+        previous_row = db.get_stage(media_id, stage)
+        previous_details = _details(previous_row) if previous_row else {}
         if not _stage_needs_work(stage, db.get_stage(media_id, stage)):
             continue
         cp = checkpoints.load(stage)
@@ -557,17 +606,17 @@ def _subtitle_stages(path: Path, row, cfg: LibraryConfig, db: Database, work: Pa
         # Recover a subtitle commit interrupted after the sidecar was moved.
         if cp.get("phase") == "ready_to_commit":
             details = cp.get("final_stage_details") or {}
-            if details.get("algorithm_version") != SUBTITLE_ALGORITHM_VERSION:
+            if details.get("algorithm_version") != SUBTITLE_ALGORITHM_VERSION or not cp.get("output_sha256"):
                 cp.pop("phase", None); cp.pop("commit_temp", None); cp.pop("final_stage_details", None)
                 checkpoints.save(stage, cp)
             else:
                 temp_value = cp.get("commit_temp")
                 temp = Path(temp_value) if temp_value else None
-                if final.exists() and final.stat().st_size > 0:
+                if final.exists() and hashlib.sha256(final.read_bytes()).hexdigest() == cp["output_sha256"]:
                     db.set_stage(media_id, stage, StageStatus.COMPLETE, details, __version__)
                     checkpoints.clear(stage)
                     continue
-                if temp is not None and temp.exists() and temp.stat().st_size > 0:
+                if temp is not None and temp.exists() and hashlib.sha256(temp.read_bytes()).hexdigest() == cp["output_sha256"]:
                     temp.replace(final)
                     db.set_stage(media_id, stage, StageStatus.COMPLETE, details, __version__)
                     checkpoints.clear(stage)
@@ -581,9 +630,15 @@ def _subtitle_stages(path: Path, row, cfg: LibraryConfig, db: Database, work: Pa
             "cached_download": str(work / f"downloaded.{language}.srt"),
         }, __version__)
         current_row = db.get_media(media_id)
+        subtitle_cfg = dict(cfg["subtitles"])
+        metadata = _details(db.get_stage(media_id, "visual_type")).get("metadata", {})
+        subtitle_cfg["eligible_date"] = metadata.get("subtitle_eligible_date")
+        audio_details = _details(db.get_stage(media_id, "audio_languages"))
+        if audio_details:
+            subtitle_cfg["audio_policy"] = audio_details
         try:
             status, details, temp_out = process_subtitle_language(
-                path, current_row, str(language), cfg["subtitles"], client, work,
+                path, current_row, str(language), subtitle_cfg, client, work,
             )
             if status == StageStatus.COMPLETE and temp_out is not None:
                 cp = checkpoints.load(stage)
@@ -592,12 +647,14 @@ def _subtitle_stages(path: Path, row, cfg: LibraryConfig, db: Database, work: Pa
                     "commit_temp": str(temp_out),
                     "final_path": str(final),
                     "final_stage_details": details,
+                    "output_sha256": hashlib.sha256(temp_out.read_bytes()).hexdigest(),
                 })
                 checkpoints.save(stage, cp)
-                if final.exists():
-                    final.unlink()
                 temp_out.replace(final)
                 db.add_event(media_id, "subtitle", f"Synchronized {language} subtitle", {"path": str(final)})
+            if status in {StageStatus.UNAVAILABLE, StageStatus.NEEDS_REVIEW}:
+                status = StageStatus.WAITING
+                details = waiting_details(previous_details, details, cfg["subtitles"])
             db.set_stage(media_id, stage, status, details, __version__)
             if status != StageStatus.PENDING:
                 checkpoints.clear(stage)
@@ -615,29 +672,48 @@ def _subtitle_stages(path: Path, row, cfg: LibraryConfig, db: Database, work: Pa
             }, __version__)
             db.set_overall(media_id, "incomplete")
             raise
+        except ProviderDeferred as exc:
+            details = waiting_details(previous_details, {"reason": str(exc), "algorithm_version": SUBTITLE_ALGORITHM_VERSION}, cfg["subtitles"], provider=True)
+            details["next_eligible_attempt"] = exc.retry_at
+            db.set_stage(media_id, stage, StageStatus.WAITING, details, __version__)
         except QuotaExhausted as exc:
-            db.set_stage(media_id, stage, StageStatus.PENDING, {"reason": str(exc)}, __version__)
-            raise BatchStop(str(exc)) from exc
+            if client is not None:
+                client.remaining_downloads = 0
+            details = waiting_details(
+                previous_details, {"reason": str(exc), "algorithm_version": SUBTITLE_ALGORITHM_VERSION},
+                cfg["subtitles"], provider=True)
+            if exc.retry_at:
+                details["next_eligible_attempt"] = exc.retry_at
+            db.set_stage(media_id, stage, StageStatus.WAITING, details, __version__)
         except Exception as exc:
-            db.set_stage(media_id, stage, StageStatus.FAILED, {
+            db.set_stage(media_id, stage, StageStatus.WAITING, waiting_details(previous_details, {
                 "error": str(exc),
                 "checkpoint_path": str(checkpoints.path_for(stage)),
                 "cached_download": str(work / f"downloaded.{language}.srt") if (work / f"downloaded.{language}.srt").exists() else None,
-            }, __version__)
+                "algorithm_version": SUBTITLE_ALGORITHM_VERSION,
+            }, cfg["subtitles"], provider=True), __version__)
 
 
 def _completion_message(db: Database, media_id: int, status: str) -> str:
     stages = db.stages(media_id)
     if status in {"needs_review", "failed", "managed_with_gaps"}:
+        issues = []
         for name, stage in stages.items():
-            if stage["status"] in {"needs_review", "failed", "insufficient_evidence", "unavailable"}:
+            if stage["status"] in {"needs_review", "failed", "insufficient_evidence", "unavailable", "waiting"}:
                 d = _details(stage)
                 reason = d.get("reason") or d.get("error") or d.get("correction_error") or stage["status"]
+                if stage["status"] == "waiting":
+                    reason = f"Waiting for suitable subtitles; next retry {d.get('next_eligible_attempt')}; {reason}"
                 correction_error = d.get("correction_error") or d.get("error")
                 if correction_error and correction_error != reason:
-                    return f"{name}: {reason} — {correction_error}"
-                return f"{name}: {reason}"
+                    reason = f"{reason} — {correction_error}"
+                issues.append(f"{name}: {reason}")
+        if issues:
+            return "; ".join(issues)
     bits: list[str] = []
+    av = stages.get("av_sync")
+    if av and _details(av).get("diagnostics", {}).get("drift_warning"):
+        bits.append(str(_details(av).get("reason")))
     crop = stages.get("crop")
     if crop:
         d = _details(crop)
@@ -679,6 +755,33 @@ def process_one(cfg: LibraryConfig, db: Database, row, client: OpenSubtitlesClie
         if ui is not None:
             ui.stage("visual", stage_index=1, stage_total=stage_total, message="classifying live-action / animation")
         visual = _visual_stage(path, row, cfg, db, ui)
+        if _stage_selected(cfg, media_id, "audio_languages"):
+            audio_stage = db.get_stage(media_id, "audio_languages")
+            cached_audio = _details(audio_stage) if audio_stage else {}
+            signature = source_signature(path)
+            if cached_audio.get("source_signature") != signature or cached_audio.get("version") != LANGUAGE_VERSION or cached_audio.get("model") != cfg["audio_languages"].get("model"):
+                if ui is not None:
+                    ui.update(message="inventorying audio and sampling spoken languages (bounded)")
+                cached_audio = detect_languages(path, probe_media(path), cfg["audio_languages"])
+                cached_audio["algorithm_version"] = LANGUAGE_VERSION
+                cached_audio["model"] = cfg["audio_languages"].get("model")
+                cached_audio["source_signature"] = signature
+                cached_audio["selection"] = audio_selections(cached_audio,
+                    _details(db.get_stage(media_id, "visual_type")).get("metadata", {}),
+                    cfg["audio_languages"].get("preferred_languages", ["en"]))
+                db.set_stage(media_id, "audio_languages", StageStatus.COMPLETE, cached_audio, __version__)
+                prior_av = db.get_stage(media_id, "av_sync")
+                if prior_av and _details(prior_av).get("verification_skipped"):
+                    db.set_stage(media_id, "av_sync", StageStatus.PENDING, _details(prior_av), __version__)
+            selection = audio_selections(cached_audio,
+                _details(db.get_stage(media_id, "visual_type")).get("metadata", {}),
+                cfg["audio_languages"].get("preferred_languages", ["en"]))
+            if selection != cached_audio.get("selection"):
+                cached_audio["selection"] = selection
+                db.set_stage(media_id, "audio_languages", StageStatus.COMPLETE, cached_audio, __version__)
+                prior_av = db.get_stage(media_id, "av_sync")
+                if prior_av and _details(prior_av).get("verification_skipped"):
+                    db.set_stage(media_id, "av_sync", StageStatus.PENDING, _details(prior_av), __version__)
         if ui is not None:
             ui.stage("a/v sync", stage_index=2, stage_total=stage_total, message=f"authoritative audio; visual={visual.value}")
         _av_stage(path, db.get_media(media_id), cfg, db, work, visual, ui)
@@ -715,10 +818,10 @@ def process_one(cfg: LibraryConfig, db: Database, row, client: OpenSubtitlesClie
         db.add_event(media_id, "failure", str(exc))
         return "failed"
     finally:
-        if final_status in {"managed", "managed_with_gaps"}:
+        if final_status == "managed":
             shutil.rmtree(work, ignore_errors=True)
             checkpoints.clear_all()
-        elif not cfg["processing"].get("preserve_incomplete_work", True) and final_status != "incomplete":
+        elif not cfg["processing"].get("preserve_incomplete_work", True) and final_status not in {"incomplete", "managed_with_gaps"}:
             shutil.rmtree(work, ignore_errors=True)
 
 
@@ -840,7 +943,7 @@ def scan_and_run(
         stages = db.stages(int(row["id"]))
         if "identity" in stages and stages["identity"]["status"] == StageStatus.NEEDS_REVIEW.value:
             continue
-        enabled_names = ["visual_type"]
+        enabled_names = ["visual_type", "audio_languages"]
         runtime = cfg.data.get("_runtime", {})
         if cfg["av_sync"].get("enabled", True) and not runtime.get("skip_av_sync"):
             enabled_names.append("av_sync")

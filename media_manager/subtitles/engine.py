@@ -12,6 +12,7 @@ import re
 import shutil
 import struct
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,16 +24,19 @@ from .. import __version__
 from ..models import MediaType, StageStatus, SubtitleCandidate
 from ..probe import audio_role_text, probe_media, stream_language
 from ..utils import MediaManagerError, require_tool, run
+from ..http_policy import open_with_retry, ProviderDeferred
 
 APP_NAME = "MediaManager"
 APP_VERSION = __version__
-SUBTITLE_ALGORITHM_VERSION = "subtitle-v7-structural-recovery"
+SUBTITLE_ALGORITHM_VERSION = "subtitle-v8-scheduled-recovery"
 SRT_RUNTIME_TOLERANCE_SECONDS = 120.0
 SRT_BACKWARD_JUMP_TOLERANCE_SECONDS = 10.0
 
 
 class QuotaExhausted(MediaManagerError):
-    pass
+    def __init__(self, message, retry_at=None):
+        super().__init__(message)
+        self.retry_at = retry_at
 
 
 class AuthenticationFailed(MediaManagerError):
@@ -82,7 +86,7 @@ class OpenSubtitlesClient:
         self.username = str(cfg.get("username") or "")
         self.api_root = str(cfg.get("api_root") or "https://api.opensubtitles.com/api/v1").rstrip("/")
         env_password = os.environ.get("OPENSUBTITLES_PASSWORD")
-        self.password = env_password if env_password is not None else password
+        self.password = env_password if env_password else password
         self.password_prompt = password_prompt
         self.token = os.environ.get("OPENSUBTITLES_TOKEN")
         self.verbose = verbose
@@ -114,17 +118,26 @@ class OpenSubtitlesClient:
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with open_with_retry(req, opener=urllib.request.urlopen, timeout=30) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
             msg = exc.read().decode("utf-8", errors="replace")
+            payload = {}
             try:
                 payload = json.loads(msg)
                 detail = payload.get("message") or payload.get("error") or msg
             except Exception:
                 detail = msg
-            if exc.code == 429:
-                raise QuotaExhausted(f"OpenSubtitles HTTP 429: {detail}") from exc
+            if exc.code == 406 and isinstance(payload, dict) and payload.get("remaining") == 0:
+                from datetime import datetime, timezone
+                retry_at = None
+                try:
+                    reset = datetime.fromisoformat(payload["reset_time_utc"].replace("Z", "+00:00"))
+                    if reset.tzinfo is not None and reset > datetime.now(timezone.utc):
+                        retry_at = reset.isoformat()
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    pass
+                raise QuotaExhausted("OpenSubtitles daily download quota exhausted", retry_at) from exc
             raise MediaManagerError(f"OpenSubtitles HTTP {exc.code} on {endpoint}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise MediaManagerError(f"OpenSubtitles network error: {exc.reason}") from exc
@@ -157,6 +170,8 @@ class OpenSubtitlesClient:
                 if not base.endswith("/api/v1"):
                     base += "/api/v1"
                 self.api_root = base
+        except ProviderDeferred:
+            raise
         except Exception as exc:
             self.login_error = exc
             raise
@@ -199,8 +214,10 @@ class OpenSubtitlesClient:
                 raise QuotaExhausted("OpenSubtitles daily download quota exhausted")
             raise MediaManagerError(f"OpenSubtitles returned no download link: {payload.get('message')}")
         req = urllib.request.Request(str(link), headers={"User-Agent": self.user_agent})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read()
+        with open_with_retry(req, opener=urllib.request.urlopen, timeout=30) as resp:
+            raw = resp.read(20_000_001)
+            if len(raw) > 20_000_000:
+                raise MediaManagerError("Subtitle download exceeds 20 MB safety limit")
         return raw, payload.get("file_name"), self.remaining_downloads
 
 
@@ -265,13 +282,19 @@ def choose_candidate(results: list[dict], row, video: Path) -> SubtitleCandidate
 
 def _unpack(raw: bytes, preferred: str | None = None) -> bytes:
     if raw.startswith(b"\x1f\x8b"):
-        return gzip.decompress(raw)
+        with gzip.GzipFile(fileobj=io.BytesIO(raw)) as source:
+            result = source.read(20_000_001)
+        if len(result) > 20_000_000:
+            raise MediaManagerError("Uncompressed subtitle exceeds 20 MB safety limit")
+        return result
     if raw.startswith(b"PK\x03\x04"):
         with zipfile.ZipFile(io.BytesIO(raw)) as z:
             names = [n for n in z.namelist() if not n.endswith("/")]
             if not names:
                 raise MediaManagerError("Downloaded subtitle ZIP was empty")
             names.sort(key=lambda n: (Path(n).suffix.casefold() != ".srt", 0 if preferred and Path(n).name.casefold() == Path(preferred).name.casefold() else 1))
+            if z.getinfo(names[0]).file_size > 20_000_000:
+                raise MediaManagerError("Uncompressed subtitle exceeds 20 MB safety limit")
             return z.read(names[0])
     return raw
 
@@ -474,7 +497,7 @@ def _extract_embedded_text_subtitle(video: Path, language: str, work: Path) -> t
     proc = run([
         ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(video),
         "-map", f"0:s:{relative_index}", "-c:s", "srt", str(output),
-    ], check=False)
+    ], check=False, timeout=300)
     if proc.returncode != 0 or not output.exists() or output.stat().st_size == 0:
         return None, None
     return output, {
@@ -511,7 +534,7 @@ def _run_ffsubsync(
     # Ordinary full-runtime ffsubsync is the trusted primary path. Sparse
     # multi-segment analysis remains available only as a fallback when the
     # primary attempt rejects itself or produces an implausible SRT.
-    help_proc = run([binary, "--help"], check=False)
+    help_proc = run([binary, "--help"], check=False, timeout=30)
     help_text = (help_proc.stdout or "") + (help_proc.stderr or "")
     multi_args: list[str] = []
     if cfg.get("multi_segment_sync", True) and "--multi-segment-sync" in help_text:
@@ -525,7 +548,10 @@ def _run_ffsubsync(
 
     def invoke(extra_args: list[str]) -> dict[str, Any]:
         output_srt.unlink(missing_ok=True)
-        proc = run(base_cmd + extra_args + safety_args, check=False)
+        remaining = float(cfg.get("_deadline", time.monotonic() + 600)) - time.monotonic()
+        if remaining <= 0:
+            raise MediaManagerError("Subtitle attempt time budget exhausted")
+        proc = run(base_cmd + extra_args + safety_args, check=False, timeout=min(remaining, 600, max(30, float(cfg.get("alignment_timeout_seconds", 300)))))
         combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
         if proc.returncode != 0 or not output_srt.exists() or output_srt.stat().st_size == 0:
             raise MediaManagerError(f"ffsubsync failed: {combined[-3000:]}")
@@ -554,11 +580,12 @@ def _run_ffsubsync(
         quality_reasons = [part.strip() for part in (low_quality_reason or "").split(";") if part.strip()]
         if not low_quality_reason:
             if score is not None and score < float(cfg.get("ffsubsync_min_score", 0.0)):
-                raise MediaManagerError(f"ffsubsync score {score} below configured minimum")
+                quality_reasons.append(f"ffsubsync score {score} below configured minimum")
             if offset is not None and abs(offset) > float(cfg.get("max_abs_offset_seconds", 600.0)):
-                raise MediaManagerError(f"ffsubsync offset {offset}s is implausibly large")
+                quality_reasons.append(f"ffsubsync offset {offset}s is implausibly large")
             if scale is not None and not (float(cfg.get("min_scale", 0.90)) <= scale <= float(cfg.get("max_scale", 1.10))):
-                raise MediaManagerError(f"ffsubsync scale factor {scale} outside accepted range")
+                quality_reasons.append(f"ffsubsync scale factor {scale} outside accepted range")
+            low_quality_reason = "; ".join(quality_reasons) or None
         result = {
             "score": score,
             "offset_seconds": offset,
@@ -697,7 +724,7 @@ def _audio_activity_segments(video: Path, audio_index: int, duration: float) -> 
         ffmpeg, "-hide_banner", "-loglevel", "info", "-i", str(video),
         "-map", f"0:a:{audio_index}", "-af", "silencedetect=noise=-35dB:d=0.35",
         "-f", "null", "/dev/null",
-    ], check=False)
+    ], check=False, timeout=300)
     silence_start = re.compile(r"silence_start:\s*([0-9.]+)")
     silence_end = re.compile(r"silence_end:\s*([0-9.]+)")
     silences: list[tuple[float, float]] = []
@@ -794,6 +821,8 @@ def process_subtitle_language(
     _forced_source: tuple[Path, str, SubtitleCandidate, int | None] | None = None,
     _recovery_context: dict[str, Any] | None = None,
 ) -> tuple[StageStatus, dict[str, Any], Path | None]:
+    cfg = dict(cfg)
+    cfg.setdefault("_deadline", time.monotonic() + min(3600, max(60, float(cfg.get("attempt_budget_seconds", 900)))))
     final = video.with_name(f"{video.stem}.{language}.srt")
     existing = _find_existing(video, language, str(cfg.get("plain_srt_language", "en"))) if cfg.get("prefer_existing", True) else None
     source = _forced_source[0] if _forced_source else existing
@@ -805,6 +834,11 @@ def process_subtitle_language(
             source = embedded
             source_kind = "embedded"
     choice: SubtitleCandidate | None = _forced_source[2] if _forced_source else None
+    if source is None and cfg.get("eligible_date"):
+        from datetime import datetime, timezone
+        if datetime.now(timezone.utc).date().isoformat() < cfg["eligible_date"] and not cfg.get("force_retry"):
+            return StageStatus.UNAVAILABLE, {"reason": "Waiting until seven days after regional digital release",
+                "release_eligible_date": cfg["eligible_date"], "algorithm_version": SUBTITLE_ALGORITHM_VERSION}, None
     remaining = _forced_source[3] if _forced_source else None
     cached_candidate_metadata: dict[str, Any] = {}
 
@@ -823,6 +857,8 @@ def process_subtitle_language(
     if source is None:
         if client is None or not client.configured():
             return StageStatus.UNAVAILABLE, {"reason": "OpenSubtitles is not configured and no existing subtitle was found"}, None
+        if getattr(client, "remaining_downloads", None) == 0:
+            raise QuotaExhausted("OpenSubtitles quota exhausted; acquisition deferred")
         try:
             h, size = opensubtitles_hash(video)
             rejected_file_ids, _ = _load_rejected_candidates(work, language)
@@ -909,6 +945,13 @@ def process_subtitle_language(
 
     temp_out = work / f"synced.{language}.srt"
     reference_audio_index, reference_audio_reason = _reference_audio_index(video, language)
+    if cfg.get("audio_policy"):
+        from ..audio_languages import canonical
+        policy = cfg["audio_policy"]
+        tracks = [t for t in policy["tracks"] if not t["excluded_role"]]
+        matches = [t for t in tracks if t.get("detected_language") == canonical(language)]
+        reference_audio_index = matches[0]["audio_index"] if matches else policy.get("selection", {}).get("playback_audio_index")
+        reference_audio_reason = "sampled_matching_language_captions" if matches else "translated_subtitles_using_selected_playback_timeline"
     if reference_audio_index is None:
         return StageStatus.NEEDS_REVIEW, {"reason": reference_audio_reason, "language": language}, None
     sync_info = _run_ffsubsync(
@@ -1085,7 +1128,11 @@ def process_subtitle_language(
         details["original_preserved"] = True
     if severity == "NEEDS_REVIEW":
         details["reason"] = adjustment_validation.get("reason")
-        return StageStatus.NEEDS_REVIEW, details, temp_out
+        if source_kind.startswith("opensubtitles"):
+            details["rejected_candidate"] = _quarantine_provider_candidate(
+                source, work, language, choice, str(details["reason"]))
+        recovered = _attempt_alternative_recovery(video, row, language, cfg, client, work, source_kind, details)
+        return recovered if recovered is not None else (StageStatus.NEEDS_REVIEW, details, None)
     return StageStatus.COMPLETE, details, temp_out
 
 
@@ -1106,6 +1153,12 @@ def _attempt_alternative_recovery(
         or not client.configured()
     ):
         return None
+    if time.monotonic() >= cfg.get("_deadline", float("inf")):
+        return StageStatus.NEEDS_REVIEW, {**initial_details, "reason": "Subtitle attempt time budget exhausted"}, None
+    if cfg.get("eligible_date") and not cfg.get("force_retry"):
+        from datetime import datetime, timezone
+        if datetime.now(timezone.utc).date().isoformat() < cfg["eligible_date"]:
+            return None
     try:
         prior_context = initial_details.get("alternative_recovery")
         if not isinstance(prior_context, dict):
@@ -1123,7 +1176,9 @@ def _attempt_alternative_recovery(
             except (TypeError, ValueError):
                 pass
 
-        candidate_limit = max(1, int(cfg.get("alternative_candidate_limit", 3)))
+        if getattr(client, "remaining_downloads", None) == 0:
+            raise QuotaExhausted("OpenSubtitles quota exhausted; acquisition deferred")
+        candidate_limit = min(10, max(1, int(cfg.get("alternative_candidate_limit", 3))))
         if len(attempted_file_ids) >= candidate_limit:
             initial_details["alternative_recovery"] = {
                 "attempted": True,
@@ -1213,7 +1268,7 @@ def _attempt_alternative_recovery(
             },
         )
         return result
-    except QuotaExhausted:
+    except (QuotaExhausted, ProviderDeferred):
         raise
     except Exception as exc:
         initial_details["alternative_recovery"] = {

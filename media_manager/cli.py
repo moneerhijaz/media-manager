@@ -271,12 +271,16 @@ def cmd_run(args) -> int:
         prompt_opensubtitles=not bool(getattr(args, "dry_run", False)),
     )
     reviewed_only = bool(getattr(args, "reviewed_only", False))
+    due_only = bool(getattr(args, "due_subtitles_only", False))
+    if due_only and (reviewed_only or getattr(args, "retry_subtitles_now", False)):
+        raise MediaManagerError("--due-subtitles-only cannot be combined with reviewed-only or forced subtitle retry")
     if getattr(args, "dry_run", False):
         return _print_reviewed_plan(cfg, args) if reviewed_only else cmd_plan(args)
     cfg.data.setdefault("_runtime", {})
     cfg.data["_runtime"]["skip_av_sync"] = bool(args.no_av_sync)
     cfg.data["_runtime"]["skip_crop"] = bool(args.no_crop)
     cfg.data["_runtime"]["skip_subtitles"] = bool(args.no_subtitles)
+    cfg.data["subtitles"]["force_retry"] = bool(getattr(args, "retry_subtitles_now", False))
     if args.subtitle_language:
         cfg.data["subtitles"]["languages"] = [x.strip() for x in args.subtitle_language.split(",") if x.strip()]
 
@@ -288,6 +292,9 @@ def cmd_run(args) -> int:
     ) if (cfg["subtitles"].get("enabled", True) and not cfg.data.get("_runtime", {}).get("skip_subtitles")) else None
     with _library_lock(cfg):
         with _db(cfg) as db:
+            if getattr(args, "retry_subtitles_now", False):
+                db.conn.execute("UPDATE stages SET status='pending' WHERE stage LIKE 'subtitle:%' AND status='waiting'")
+                db.conn.commit()
             recovered = recover_reentrant_state(cfg, db)
             if any(recovered.values()) and args.verbose:
                 print(
@@ -295,6 +302,14 @@ def cmd_run(args) -> int:
                     + ", ".join(f"{k}={v}" for k, v in recovered.items() if v)
                 )
             selected_ids: list[int] | None = None
+            if due_only:
+                from .retry_policy import eligible
+                selection = {}
+                for item in db.conn.execute("SELECT media_id,stage,details_json FROM stages WHERE status='waiting' AND stage LIKE 'subtitle:%'"):
+                    if eligible(json.loads(item["details_json"] or "{}")):
+                        selection.setdefault(str(item["media_id"]), []).append(item["stage"])
+                cfg.data["_runtime"]["selected_stages"] = selection
+                selected_ids = [int(key) for key in selection]
             if reviewed_only:
                 selection = _reviewed_selection(
                     db,
@@ -331,7 +346,7 @@ def cmd_run(args) -> int:
                     verbose=args.verbose,
                     client=client,
                     progress_enabled=not args.no_progress,
-                    scan=not reviewed_only,
+                    scan=not (reviewed_only or due_only),
                     media_ids=selected_ids,
                 )
                 remaining = client.remaining_downloads if client else None
@@ -969,6 +984,15 @@ def cmd_set_visual_type(args) -> int:
 
 
 def cmd_web(args) -> int:
+    if getattr(args, "app_state", None):
+        state_root = Path(args.app_state).expanduser().resolve()
+        state_root.mkdir(parents=True, exist_ok=True)
+        cfg = LibraryConfig.load(state_root) if LibraryConfig.exists(state_root) else LibraryConfig.init(state_root)
+        from .web import serve
+        serve(cfg, host=str(args.host), port=int(args.port),
+              token_file=Path(args.token_file).expanduser().resolve() if args.token_file else None,
+              standalone=True)
+        return 0
     library_root = Path(args.library_root).expanduser().resolve()
     if not library_root.is_dir():
         raise MediaManagerError(f"Library root is not a directory: {library_root}")
@@ -996,6 +1020,8 @@ def _add_run_flags(q) -> None:
     q.add_argument("--no-av-sync", action="store_true")
     q.add_argument("--no-crop", action="store_true")
     q.add_argument("--no-subtitles", action="store_true")
+    q.add_argument("--retry-subtitles-now", action="store_true", help="Bypass subtitle cooldown/release schedule, retaining candidate validation")
+    q.add_argument("--due-subtitles-only", action="store_true", help="Retry only eligible waiting subtitles without a library scan")
     q.add_argument("--subtitle-language", help="Comma-separated languages, e.g. en,ar")
     q.add_argument("-v", "--verbose", action="store_true")
     q.add_argument("--no-progress", action="store_true", help="Disable the live single-line progress display")
@@ -1008,10 +1034,31 @@ def _add_run_flags(q) -> None:
     q.add_argument("--media-id", type=int, help="With --reviewed-only, retry only this database media ID")
 
 
+def cmd_setup_languages(args) -> int:
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise MediaManagerError("Install the languages extra first: pipx inject stateful-media-manager faster-whisper") from exc
+    cfg = _ensure_config(args, auto_init=False)
+    with _library_lock(cfg):
+        WhisperModel(args.model, device="cpu", compute_type="int8", cpu_threads=2)
+        cfg["audio_languages"]["model"] = args.model
+        cfg.save()
+        with _db(cfg) as db:
+            # Recheck unavailable language results after explicit model setup.
+            db.conn.execute("DELETE FROM stages WHERE stage='audio_languages'")
+            db.conn.commit()
+    print("Language model cached. Processing will use local files only.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="media-manager", description="Stateful media QA and repair manager")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = p.add_subparsers(dest="command", required=True)
+    q = sub.add_parser("setup-languages", help="Download/cache the optional local speech-language model")
+    q.add_argument("--model", default="tiny")
+    q.set_defaults(func=cmd_setup_languages)
 
     q = sub.add_parser("init", help="Initialize the current directory as a media-manager library")
     add_os_flags(q); q.set_defaults(func=cmd_init)
@@ -1059,6 +1106,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("path"); q.add_argument("type", choices=[x.value for x in VisualType]); q.set_defaults(func=cmd_set_visual_type)
     q = sub.add_parser("web", help="Run the authenticated local web dashboard")
     q.add_argument("--library-root", default=".", help="Initialized media library (default: current directory)")
+    q.add_argument("--app-state", help="Separate dashboard state directory; libraries come from MEDIA_LIBRARIES")
     q.add_argument("--host", default="0.0.0.0", help="Listen on every network interface (default: 0.0.0.0)")
     q.add_argument("--port", type=int, default=8787, help="Listen port (default: 8787)")
     q.add_argument("--token-file", help="Dashboard token file (default: .media-manager/web-token)")
@@ -1074,6 +1122,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        from .environment import load_environment
+        load_environment(getattr(args, "library_root", None))
         return int(args.func(args))
     except KeyboardInterrupt:
         print("\nPaused. Stage and intra-stage checkpoint state has been preserved. Resume with 'media-manager resume'.", file=sys.stderr)

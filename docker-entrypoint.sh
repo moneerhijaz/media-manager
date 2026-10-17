@@ -1,30 +1,15 @@
 #!/bin/sh
 set -eu
 
-run_as_library_owner=""
-if [ "$(id -u)" = "0" ] && [ -d /library ]; then
-    library_uid=$(stat -c '%u' /library)
-    library_gid=$(stat -c '%g' /library)
-    if [ "$library_uid" != "0" ]; then
-        mkdir -p "$HOME"
-        chown "$library_uid:$library_gid" "$HOME"
-        run_as_library_owner="setpriv --reuid=$library_uid --regid=$library_gid --clear-groups"
-    fi
-fi
-
-if [ "$#" -ge 2 ] && [ "$1" = "media-manager" ] && [ "$2" = "web" ] \
-    && [ ! -f /library/.media-manager/config.toml ]; then
-    if [ -n "$run_as_library_owner" ]; then
-        # shellcheck disable=SC2086
-        $run_as_library_owner sh -c 'cd /library && exec media-manager init'
-    else
-        cd /library
-        media-manager init
-    fi
-fi
-
-if [ -n "$run_as_library_owner" ]; then
-    # shellcheck disable=SC2086
-    exec $run_as_library_owner "$@"
+# App state is independent of every media mount. Never chown media folders.
+if [ "$(id -u)" = "0" ]; then
+    app_uid=${MEDIA_MANAGER_UID:-1000}
+    app_gid=${MEDIA_MANAGER_GID:-1000}
+    case "$app_uid:$app_gid" in
+        *[!0-9:]*|:*|*:) echo "Invalid MEDIA_MANAGER_UID/GID" >&2; exit 1 ;;
+    esac
+    mkdir -p /state /state/models "$HOME"
+    chown "$app_uid:$app_gid" /state /state/models "$HOME"
+    exec setpriv --reuid="$app_uid" --regid="$app_gid" --clear-groups "$@"
 fi
 exec "$@"

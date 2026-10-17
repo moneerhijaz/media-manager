@@ -14,6 +14,7 @@ class StageStatus(StrEnum):
     NOT_NEEDED = "not_needed"
     NOT_APPLICABLE = "not_applicable"
     UNAVAILABLE = "unavailable"
+    WAITING = "waiting"
     INSUFFICIENT_EVIDENCE = "insufficient_evidence"
     NEEDS_REVIEW = "needs_review"
     FAILED = "failed"

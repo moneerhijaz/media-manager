@@ -257,7 +257,7 @@ def test_silero_vad_streams_ffmpeg_pcm_without_torchaudio_file_io(monkeypatch, t
 
 def test_avsync_algorithm_version_invalidates_old_torchcodec_failure():
     from media_manager.executor import AVSYNC_ALGORITHM_VERSION, _stage_needs_work
-    assert AVSYNC_ALGORITHM_VERSION == "avsync-v9-robust-policy"
+    assert AVSYNC_ALGORITHM_VERSION == "avsync-v10-drift-policy"
     old = {
         "status": "needs_review",
         "details_json": '{"algorithm_version":"avsync-v4-speech-syncnet-evidence","error":"torchaudio requires torchcodec"}',

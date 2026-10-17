@@ -24,6 +24,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "checkpoint_seconds": 60.0,
         "preserve_incomplete_work": True,
     },
+    "metadata": {"region": "US"},
+    "audio_languages": {"model": "tiny", "timeout_seconds": 300, "preferred_languages": ["en"]},
     "av_sync": {
         "enabled": True,
         "backend": "syncnet",
@@ -39,7 +41,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "not_needed_threshold_ms": 45.0,
         "max_auto_offset_ms": 500.0,
         "max_spread_ms": 80.0,
-        "max_drift_ms_per_hour": 80.0,
+        "max_drift_ms_per_hour": 200.0,
         "apply_corrections": True,
         "shift_all_audio_streams": False,
         "allow_unknown_visual_type": True,
@@ -102,6 +104,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Includes the first provider result; rejected IDs/hashes are persisted
         # so later runs continue with a different release.
         "alternative_candidate_limit": 3,
+        "retry_cooldown_hours": 168.0,
+        "provider_backoff_hours": 24.0,
+        "alignment_timeout_seconds": 300.0,
+        "attempt_budget_seconds": 900.0,
     },
     "opensubtitles": {
         "username": "",
@@ -171,6 +177,11 @@ class LibraryConfig:
             raise MediaManagerError(f"No media-manager config in {root}")
         with path.open("rb") as fh:
             raw = tomllib.load(fh)
+        # Migrate the former shipped default; preserve non-default custom limits.
+        av = raw.get("av_sync", {})
+        if av.get("max_drift_ms_per_hour") == 80.0 and not av.get("drift_policy_version"):
+            av["max_drift_ms_per_hour"] = 200.0
+        av["drift_policy_version"] = 1
         cfg = cls(root, _merge(DEFAULT_CONFIG, raw))
         if cfg.data["library"].get("root") != str(root):
             cfg.data["library"]["root"] = str(root)

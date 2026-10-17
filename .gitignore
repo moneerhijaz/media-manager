@@ -9,6 +9,7 @@
 # Local credentials and environment overrides
 .env
 .env.*
+compose.override.yaml
 !.env.example
 *.pem
 *.key

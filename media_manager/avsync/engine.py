@@ -30,7 +30,7 @@ from ..utils import MediaManagerError, require_tool, run
 
 SILENCE_START_RE = re.compile(r"silence_start:\s*([0-9.]+)")
 SILENCE_END_RE = re.compile(r"silence_end:\s*([0-9.]+)")
-AVSYNC_ALGORITHM_VERSION = "avsync-v9-robust-policy"
+AVSYNC_ALGORITHM_VERSION = "avsync-v10-drift-policy"
 
 
 class SyncNetAdapterError(MediaManagerError):
@@ -1113,10 +1113,23 @@ def evaluate_saved_observations(
     drift, drift_evidence = _robust_drift(observations, duration)
     diagnostics = dict(data.get("diagnostics") or {})
     diagnostics["drift_evidence"] = drift_evidence
+    diagnostics["drift_verified"] = bool(drift_evidence["actionable"])
+    diagnostics["estimated_accumulated_drift_ms"] = drift * duration / 3600.0 if drift_evidence["actionable"] else None
+    # Judge consistency around the fitted trend, not around a flat line.
+    # Accepting drift is deliberately not permission to shift or stretch audio.
+    detrended = [item.offset_frames * 40.0 - drift * item.time / 3600.0 for item in observations]
+    intercept = statistics.median(detrended)
+    residual_spread = statistics.median(abs(value - intercept) for value in detrended) * 1.4826
+    diagnostics["drift_residual_spread_ms"] = residual_spread
     confidence = statistics.median(item.confidence for item in observations)
     if drift_evidence["actionable"] and abs(drift) > float(cfg["max_drift_ms_per_hour"]):
         status = StageStatus.NEEDS_REVIEW
         why = f"Progressive drift detected ({drift:.1f} ms/hour)"
+    elif drift_evidence["actionable"] and abs(drift) > 0.001 and residual_spread <= float(cfg["max_spread_ms"]) and abs(intercept) <= float(cfg["not_needed_threshold_ms"]):
+        status = StageStatus.NOT_NEEDED
+        diagnostics["drift_warning"] = True
+        why = (f"Accepted drift {drift:+.1f} ms/hour; estimated accumulated change "
+               f"{drift * duration / 3600.0:+.1f} ms (not a measured starting offset)")
     elif spread > float(cfg["max_spread_ms"]):
         status = StageStatus.NEEDS_REVIEW
         why = f"SyncNet observations disagree (robust spread {spread:.1f} ms)"
@@ -1208,6 +1221,9 @@ def analyze_av_sync(
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> AVAnalysis:
     audio_index, audio_reason = choose_authoritative_audio(probe, str(cfg["authoritative_language"]))
+    if "reference_audio_index" in cfg:
+        audio_index = cfg["reference_audio_index"]
+        audio_reason = "verified_original_language"
     if audio_index is None:
         return AVAnalysis(
             StageStatus.NEEDS_REVIEW,

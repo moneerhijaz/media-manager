@@ -6,8 +6,18 @@ services:
         INSTALL_AVSYNC: "1"
     image: stateful-media-manager:local
     init: true
+    environment:
+      TMDB_READ_TOKEN: "${TMDB_READ_TOKEN:-}"
+      OPENSUBTITLES_USERNAME: "${OPENSUBTITLES_USERNAME:-}"
+      OPENSUBTITLES_API_KEY: "${OPENSUBTITLES_API_KEY:-}"
+      OPENSUBTITLES_PASSWORD: "${OPENSUBTITLES_PASSWORD:-}"
+      OPENSUBTITLES_TOKEN: "${OPENSUBTITLES_TOKEN:-}"
+      HF_HOME: /state/models/huggingface
+      MEDIA_LIBRARIES: "${MEDIA_LIBRARIES:-[]}"
+      MEDIA_MANAGER_UID: "${MEDIA_MANAGER_UID:-1000}"
+      MEDIA_MANAGER_GID: "${MEDIA_MANAGER_GID:-1000}"
     volumes:
-      - "${MEDIA_LIBRARY:?Set MEDIA_LIBRARY to the absolute media-library path}:/library"
+      - media-manager-state:/state
     ports:
       - "${MEDIA_MANAGER_BIND:-0.0.0.0}:${MEDIA_MANAGER_PORT:-8787}:8787"
     stop_grace_period: 45s
@@ -18,3 +28,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+volumes:
+  media-manager-state:

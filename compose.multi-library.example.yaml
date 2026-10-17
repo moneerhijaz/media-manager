@@ -1,0 +1,10 @@
+# Copy to compose.override.yaml and replace the host paths below.
+# No primary library: all media roots are peers; app state lives in /state.
+# Each host directory needs BOTH a mount and a MEDIA_LIBRARIES entry.
+services:
+  media-manager:
+    environment:
+      MEDIA_LIBRARIES: '["/libraries/archive", "/libraries/family"]'
+    volumes:
+      - /absolute/path/to/ArchiveMedia:/libraries/archive
+      - /absolute/path/to/FamilyMedia:/libraries/family

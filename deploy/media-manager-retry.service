@@ -1,0 +1,9 @@
+[Unit]
+Description=Resume eligible Media Manager work
+
+[Service]
+Type=oneshot
+# Edit both paths before installing this user service.
+WorkingDirectory=/path/to/media-library
+ExecStart=%h/.local/bin/media-manager resume --due-subtitles-only --no-progress
+StandardInput=null
