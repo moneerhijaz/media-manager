@@ -1,0 +1,9 @@
+Disposable synthetic library: /tmp/media-manager-demo.d8wy3T
+Initialized: /tmp/media-manager-demo.d8wy3T/.media-manager
+Config:      /tmp/media-manager-demo.d8wy3T/.media-manager/config.toml
+Database:    /tmp/media-manager-demo.d8wy3T/.media-manager/media-manager.db
+Discovered 1: 1 new, 0 changed, 0 unchanged, 0 moved/reconnected, 0 missing historical, 0 conflicts, 0 failures
+Library: /tmp/media-manager-demo.d8wy3T
+Videos discovered: 1
+   1. Movies/Synthetic Demo (2026).mp4
+      visual_type -> av_sync -> crop -> subtitle:en -> final_verify

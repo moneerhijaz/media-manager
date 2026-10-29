@@ -99,6 +99,9 @@ def test_face_hint_uses_configurable_low_rate_sampling(monkeypatch, tmp_path):
         seen["command"] = command
         return SimpleNamespace(stdout=b"")
 
+    # This command-construction test must not require the optional OpenCV extra.
+    import sys
+    monkeypatch.setitem(sys.modules, "cv2", SimpleNamespace())
     monkeypatch.setattr(engine, "require_tool", lambda _name: "ffmpeg")
     monkeypatch.setattr(engine, "run", fake_run)
 
